@@ -1,0 +1,6 @@
+{
+  "name": "ESP32 智能像素时钟 | ESP-PixelMatrix",
+  "description": "基于乐鑫 ESP32-S3 双核主控的高性能智能像素时钟平台，提供 8x32 RGB 矩阵显示、NTP授时、Home Assistant 联动与开源生态方案。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
