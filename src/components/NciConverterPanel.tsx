@@ -1,515 +1,555 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
-  FileCode, Upload, Download, Copy, Check, Play, 
-  Sparkles, Sliders, RefreshCw, Layers, ArrowRight, Eye, Send
+  FileCode, Upload, Download, Copy, Check, Play, Pause,
+  Layers, Eye, Send, Terminal, Sparkles, RefreshCw, X, ArrowUpRight
 } from 'lucide-react';
 import { 
-  makeNci, downloadNciFile, generateCppRgb565Code, 
-  rgbToRgb565, rgb565ToRgb, rgb565ToHex 
+  makeNci, fileToNciFrames, downloadNciBlob, generateCppRgb565Code,
+  nciRawFrameToHexGrid, NciRawFrame 
 } from '../utils/nciFormat';
 
 interface NciConverterPanelProps {
   onLoadToSimulator?: (framesRgb: string[][][], fps: number, title: string) => void;
 }
 
+interface LogEntry {
+  text: string;
+  type: 'info' | 'ok' | 'err';
+  time: string;
+}
+
 export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSimulator }) => {
   const [file, setFile] = useState<File | null>(null);
+  const [sizeKey, setSizeKey] = useState<'8x8' | '32x8'>('8x8');
+  const [frameMsOverride, setFrameMsOverride] = useState<number>(0);
+  const [maxFrames, setMaxFrames] = useState<number>(60);
   const [iconName, setIconName] = useState<string>('time');
-  const [iconCustom, setIconCustom] = useState<string>('weather');
-  const [width, setWidth] = useState<number>(8);
-  const [height, setHeight] = useState<number>(8);
-  const [frameCount, setFrameCount] = useState<number>(1);
-  const [frameMs, setFrameMs] = useState<number>(120);
-  const [deviceIp, setDeviceIp] = useState<string>('192.168.4.1');
-  
-  const [convertedFrames, setConvertedFrames] = useState<number[][]>([]);
-  const [previewFrameIdx, setPreviewFrameIdx] = useState<number>(0);
+  const [deviceUrl, setDeviceUrl] = useState<string>('');
+
+  // Conversion results
+  const [frames, setFrames] = useState<NciRawFrame[]>([]);
+  const [nciBlob, setNciBlob] = useState<Blob | null>(null);
+  const [metaInfo, setMetaInfo] = useState<string>('未载入文件');
+  const [activeFrameIndex, setActiveFrameIndex] = useState<number>(0);
+  const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
-  const [statusMessage, setStatusMessage] = useState<string>('请选择图片（PNG/GIF/JPG）开始转换');
-  const [isUploadSuccess, setIsUploadSuccess] = useState<boolean>(false);
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [logs, setLogs] = useState<LogEntry[]>([
+    { text: '转换引擎已就绪：支持解析标准 PNG 及多帧 GIF 动图', type: 'info', time: 'SYS' }
+  ]);
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const targetName = iconName === 'custom' ? (iconCustom.trim() || 'custom') : iconName;
+  // Target resolution
+  const [targetWidth, targetHeight] = sizeKey === '8x8' ? [8, 8] : [32, 8];
 
-  // Process uploaded image file into RGB565 frames
-  const processImage = (imgFile: File) => {
-    setIsProcessing(true);
-    setStatusMessage('正在解析图片并提取 RGB565 帧数据...');
-
-    const url = URL.createObjectURL(imgFile);
-    const img = new Image();
-
-    img.onload = async () => {
-      try {
-        const offscreen = document.createElement('canvas');
-        const ctx = offscreen.getContext('2d');
-        if (!ctx) throw new Error('无法创建 Canvas 2D 绘图环境');
-
-        offscreen.width = width;
-        offscreen.height = height;
-
-        const frames: number[][] = [];
-        const fc = Math.max(1, Math.min(60, frameCount));
-
-        for (let i = 0; i < fc; i++) {
-          ctx.clearRect(0, 0, width, height);
-          ctx.drawImage(img, 0, 0, width, height);
-
-          const imgData = ctx.getImageData(0, 0, width, height).data;
-          const frameRgb565: number[] = [];
-
-          for (let p = 0; p < width * height; p++) {
-            const r = imgData[p * 4];
-            const g = imgData[p * 4 + 1];
-            const b = imgData[p * 4 + 2];
-            const a = imgData[p * 4 + 3];
-
-            // If transparent / dark pixel
-            if (a < 25) {
-              frameRgb565.push(0);
-            } else {
-              frameRgb565.push(rgbToRgb565(r, g, b));
-            }
-          }
-
-          frames.push(frameRgb565);
-          if (fc > 1) {
-            await new Promise(r => setTimeout(r, 20));
-          }
-        }
-
-        setConvertedFrames(frames);
-        setPreviewFrameIdx(0);
-        setStatusMessage(`成功转换 ${targetName} · ${width}×${height} · ${frames.length} 帧 · NCI1 RGB565`);
-      } catch (err: any) {
-        console.error('Image processing failed:', err);
-        setStatusMessage(`转换失败: ${err.message || '图片格式不支持'}`);
-      } finally {
-        setIsProcessing(false);
-        URL.revokeObjectURL(url);
-      }
-    };
-
-    img.onerror = () => {
-      setStatusMessage('图片加载失败，请检查文件是否为有效图片');
-      setIsProcessing(false);
-      URL.revokeObjectURL(url);
-    };
-
-    img.src = url;
+  const addLog = (text: string, type: 'info' | 'ok' | 'err' = 'info') => {
+    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    setLogs(prev => [...prev, { text, type, time }]);
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
-    if (selected) {
-      setFile(selected);
-      processImage(selected);
-    }
+  const clearLog = () => {
+    setLogs([]);
   };
 
-  // Re-render preview canvas whenever convertedFrames or previewFrameIdx changes
+  function validName(s: string): boolean {
+    return /^[A-Za-z0-9_-]{1,31}$/.test(s);
+  }
+
+  // Animation player timer matching exact GIF delays
   useEffect(() => {
-    if (!canvasRef.current || convertedFrames.length === 0) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!isPlaying || frames.length <= 1) return;
+    const currentDelay = Math.max(30, frames[activeFrameIndex]?.delay || 200);
+    const timer = setTimeout(() => {
+      setActiveFrameIndex(prev => (prev + 1) % frames.length);
+    }, currentDelay);
+    return () => clearTimeout(timer);
+  }, [isPlaying, frames, activeFrameIndex]);
 
-    canvas.width = width;
-    canvas.height = height;
-
-    const frame = convertedFrames[previewFrameIdx] || convertedFrames[0];
-    const imgData = ctx.createImageData(width, height);
-
-    for (let i = 0; i < frame.length; i++) {
-      const v = frame[i];
-      if (v === 0) {
-        imgData.data[i * 4] = 16;
-        imgData.data[i * 4 + 1] = 20;
-        imgData.data[i * 4 + 2] = 28;
-        imgData.data[i * 4 + 3] = 255;
-      } else {
-        const [r, g, b] = rgb565ToRgb(v);
-        imgData.data[i * 4] = r;
-        imgData.data[i * 4 + 1] = g;
-        imgData.data[i * 4 + 2] = b;
-        imgData.data[i * 4 + 3] = 255;
-      }
+  // Handle conversion matching exact functional logic from index_3f785a56.html
+  const handleConvert = async (inputFile?: File) => {
+    const f = inputFile || file;
+    if (!f) {
+      addLog('请先选择或拖入 PNG / GIF 图片文件', 'err');
+      return;
     }
 
-    ctx.putImageData(imgData, 0, 0);
-  }, [convertedFrames, previewFrameIdx, width, height]);
-
-  // Download .nci binary
-  const handleDownloadNci = () => {
-    if (convertedFrames.length === 0) return;
-    const nciBytes = makeNci(convertedFrames, width, height, frameMs);
-    downloadNciFile(nciBytes, `${targetName}.nci`);
-  };
-
-  // Copy C++ RGB565 code
-  const handleCopyCppCode = () => {
-    if (convertedFrames.length === 0) return;
-    const code = generateCppRgb565Code(convertedFrames, targetName, width, height, frameMs);
-    navigator.clipboard.writeText(code);
-    setCopiedCode(true);
-    setTimeout(() => setCopiedCode(false), 2000);
-  };
-
-  // Push converted frames to the top 8x32 simulator
-  const handleLoadToClock = () => {
-    if (convertedFrames.length === 0 || !onLoadToSimulator) return;
-
-    // Convert each RGB565 frame to 8x32 hex matrix
-    const hexFrames: string[][][] = convertedFrames.map(frame => {
-      const grid: string[][] = [];
-      for (let r = 0; r < 8; r++) {
-        const row: string[] = [];
-        for (let c = 0; c < 32; c++) {
-          if (r < height && c < width) {
-            const idx = r * width + c;
-            const px = frame[idx];
-            row.push(px === 0 ? '' : rgb565ToHex(px));
-          } else {
-            row.push('');
-          }
-        }
-        grid.push(row);
-      }
-      return grid;
-    });
-
-    const fps = Math.round(1000 / Math.max(30, frameMs));
-    onLoadToSimulator(hexFrames, fps, `NCI: ${targetName}`);
-  };
-
-  // Upload to ESP32 device via HTTP PUT /api/v1/icons/{name}
-  const handleUploadToDevice = async () => {
-    if (convertedFrames.length === 0) return;
     setIsProcessing(true);
-    setIsUploadSuccess(false);
-    setStatusMessage(`正在上传至设备 http://${deviceIp}/api/v1/icons/${targetName} ...`);
-
     try {
-      const nciBytes = makeNci(convertedFrames, width, height, frameMs);
-      const url = `http://${deviceIp}/api/v1/icons/${encodeURIComponent(targetName)}`;
-      
-      const res = await fetch(url, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: new Blob([nciBytes.buffer as ArrayBuffer]),
-      });
+      const isGif = f.type === 'image/gif' || f.name.toLowerCase().endsWith('.gif');
+      addLog(isGif ? `开始二进制 LZW 解码动图: ${f.name} ...` : `解析静态像素图像: ${f.name} ...`, 'info');
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+      const parsedFrames = await fileToNciFrames(
+        f,
+        targetWidth,
+        targetHeight,
+        maxFrames,
+        frameMsOverride
+      );
+
+      if (!parsedFrames || parsedFrames.length === 0) {
+        throw new Error('未能从图片中解析出有效像素帧');
       }
 
-      setIsUploadSuccess(true);
-      setStatusMessage(`✅ 上传成功！设备图标已更新至 /api/v1/icons/${targetName}`);
+      const finalFrameMs = frameMsOverride || parsedFrames[0].delay || 200;
+      const blob = makeNci(parsedFrames, targetWidth, targetHeight, finalFrameMs);
+
+      setFrames(parsedFrames);
+      setNciBlob(blob);
+      setActiveFrameIndex(0);
+      setIsPlaying(true);
+
+      const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+      const infoStr = `${targetWidth}×${targetHeight} · ${parsedFrames.length} 帧 · 帧间隔 ${finalFrameMs}ms · NCI1 固件 ${blob.size} 字节 (${base}.nci)`;
+      setMetaInfo(infoStr);
+
+      addLog(`转换成功！已生成 ${parsedFrames.length} 帧 16-bit RGB565 数据，体积 ${blob.size} 字节`, 'ok');
     } catch (err: any) {
-      console.warn('Direct device upload failed:', err);
-      // Explain CORS / hotspot connectivity note
-      setStatusMessage(`设备上传提示: ${err.message || '网络连接失败'}（请确认手机/电脑已连接 NeoClock 热点）`);
+      console.error('NCI conversion failed:', err);
+      addLog(`转换失败: ${err.message || String(err)}`, 'err');
+      setMetaInfo('转换出错');
     } finally {
       setIsProcessing(false);
     }
   };
 
+  // Download .nci binary
+  const handleDownloadNci = () => {
+    if (!nciBlob) return;
+    const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+    downloadNciBlob(nciBlob, `${base}.nci`);
+    addLog(`已保存 NCI1 二进制固件至本地: ${base}.nci`, 'ok');
+  };
+
+  // Load to 8x32 simulator above
+  const handleLoadToSimulator = () => {
+    if (!onLoadToSimulator || frames.length === 0) return;
+    const finalFrameMs = frameMsOverride || frames[0].delay || 200;
+    const fps = Math.round(1000 / Math.max(30, finalFrameMs));
+
+    // Convert to hex matrix (8 rows × 32 cols)
+    const hexGrids: string[][][] = frames.map(fr => {
+      const rawGrid = nciRawFrameToHexGrid(fr, targetWidth, targetHeight);
+      if (targetWidth === 8) {
+        // Horizontally center 8x8 icon on 8x32 display (12 cols empty, 8 cols icon, 12 cols empty)
+        return rawGrid.map(row => [
+          ...Array(12).fill('#121721'),
+          ...row,
+          ...Array(12).fill('#121721')
+        ]);
+      }
+      return rawGrid;
+    });
+
+    const base = iconName.trim() || 'icon';
+    onLoadToSimulator(hexGrids, fps, `NCI: ${base}`);
+    addLog(`已成功载入上方 8×32 硬件仿真器进行全彩连续播放（${frames.length} 帧，${fps} FPS）`, 'ok');
+  };
+
+  // Copy C++ uint16_t RGB565 Array code
+  const handleCopyCppCode = () => {
+    if (frames.length === 0) return;
+    const finalFrameMs = frameMsOverride || frames[0].delay || 200;
+    const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+    const code = generateCppRgb565Code(frames, base, targetWidth, targetHeight, finalFrameMs);
+    navigator.clipboard.writeText(code);
+    setCopiedCode(true);
+    addLog('C++ uint16_t RGB565 数组已复制到剪贴板，可直接粘贴进 Arduino / ESP-IDF 项目', 'ok');
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  // Upload to ESP32 device via HTTP PUT /api/v1/icons/{name}
+  const handleUploadToDevice = async () => {
+    try {
+      if (!nciBlob) throw new Error('请先转换图片生成 NCI 固件');
+      const dev = deviceUrl.trim().replace(/\/$/, '');
+      const name = iconName.trim();
+      if (!dev) throw new Error('请输入设备地址（例如 http://192.168.1.55）');
+      if (!validName(name)) throw new Error('图标名称只能包含字母、数字、_、-，长度 1..31');
+
+      addLog(`正在推送到设备: ${dev}/api/v1/icons/${encodeURIComponent(name)} ...`, 'info');
+
+      const res = await fetch(`${dev}/api/v1/icons/${encodeURIComponent(name)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: nciBlob,
+      });
+
+      const txt = await res.text();
+      if (!res.ok) throw new Error(txt || `HTTP ${res.status}`);
+
+      addLog(`上传成功！ESP32 设备图标已更新至 /api/v1/icons/${name}`, 'ok');
+    } catch (err: any) {
+      addLog(`上传失败: ${err.message || String(err)}（请确认当前网络已接入 NeoClock 热点）`, 'err');
+    }
+  };
+
+  const currentFrame = frames[activeFrameIndex];
+
   return (
-    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm transition-colors duration-200">
+    <div id="nci-converter" className="bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm transition-colors duration-200 space-y-6">
       
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-slate-800 mb-6">
+      {/* 1. Header Bar matching Site Theme */}
+      <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-200 dark:border-slate-800">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-[#FF6B6B] to-[#FFA07A] flex items-center justify-center text-white shadow-sm">
+          <div className="w-9 h-9 rounded-xl bg-[#E60012]/10 border border-[#E60012]/20 flex items-center justify-center text-[#E60012]">
             <FileCode className="w-5 h-5" />
           </div>
           <div>
             <div className="flex items-center gap-2">
               <h3 className="text-base font-bold text-slate-900 dark:text-white">
-                NCI RGB565 图标与动画转换工具
+                NCI RGB565 固件转换工作台
               </h3>
-              <span className="text-[10px] font-mono font-semibold text-[#FF6B6B] bg-[#FF6B6B]/10 px-2 py-0.5 rounded border border-[#FF6B6B]/20">
-                NeoClock / Awtrix 官方标准
+              <span className="text-[10px] font-mono font-medium text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                NeoClock / Awtrix 原生格式
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              单文件零依赖 · 支持 PNG/GIF 转换为 16-bit RGB565 NCI1 二进制固件格式并即时预览
+              单文件独立工具：支持将本地 PNG / GIF 转化为 16-bit RGB565 NCI1 二进制固件，提供实时像素预览与一键导入时钟。
             </p>
           </div>
         </div>
 
-        <div className="text-xs font-mono text-slate-500 dark:text-slate-400 flex items-center gap-1.5 bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700">
-          <span>标识: NCI1 (0x4E 0x43 0x49 0x31)</span>
+        {/* Target Size Toggle Pill */}
+        <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-mono">
+          <button
+            onClick={() => setSizeKey('8x8')}
+            className={`px-3 py-1 rounded-lg font-medium transition-all ${
+              sizeKey === '8x8'
+                ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-xs'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            8×8 图标
+          </button>
+          <button
+            onClick={() => setSizeKey('32x8')}
+            className={`px-3 py-1 rounded-lg font-medium transition-all ${
+              sizeKey === '32x8'
+                ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-xs'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            32×8 横幅全景
+          </button>
         </div>
       </div>
 
+      {/* 2. Main Interactive Workspace (Left: Upload & Settings, Right: Pixel Matrix Preview) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         
-        {/* Left Form: Inputs & Settings (7 cols) */}
+        {/* Left Column: File Drop & Configuration (7 cols) */}
         <div className="lg:col-span-7 space-y-4">
           
-          {/* File input */}
-          <div>
-            <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-              选择源图片文件 (PNG / GIF / JPG / WebP):
-            </label>
-            <div className="relative border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-[#FF6B6B] dark:hover:border-[#FF6B6B] rounded-xl p-4 text-center cursor-pointer transition-colors bg-slate-50/50 dark:bg-slate-950/40">
-              <input
-                type="file"
-                accept="image/png,image/gif,image/jpeg,image/webp"
-                onChange={handleFileChange}
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-              />
-              <div className="flex flex-col items-center justify-center gap-1.5">
-                <Upload className="w-5 h-5 text-slate-400" />
-                <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                  {file ? file.name : '点击或拖拽图片到此处'}
-                </span>
-                <span className="text-[11px] text-slate-400">
-                  支持动图 GIF 或透明背景 PNG
-                </span>
+          {/* Drag & Drop File Zone */}
+          <div
+            onDragOver={e => {
+              e.preventDefault();
+              setIsDragging(true);
+            }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={e => {
+              e.preventDefault();
+              setIsDragging(false);
+              const f = e.dataTransfer.files?.[0];
+              if (f) {
+                setFile(f);
+                const cleanName = f.name.replace(/\.[^/.]+$/, '').replace(/[^A-Za-z0-9_-]/g, '');
+                if (cleanName && iconName === 'time') setIconName(cleanName.substring(0, 31));
+                handleConvert(f);
+              }
+            }}
+            onClick={() => fileInputRef.current?.click()}
+            className={`group relative p-4 rounded-xl border-2 border-dashed transition-all cursor-pointer flex items-center justify-between gap-4 ${
+              isDragging 
+                ? 'border-[#E60012] bg-[#E60012]/5 dark:bg-[#E60012]/10' 
+                : 'border-slate-300 dark:border-slate-700 hover:border-[#E60012]/60 hover:bg-slate-50 dark:hover:bg-slate-800/50 bg-slate-50/50 dark:bg-slate-800/30'
+            }`}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/gif,image/jpeg,image/webp"
+              onChange={e => {
+                const f = e.target.files?.[0];
+                if (f) {
+                  setFile(f);
+                  const cleanName = f.name.replace(/\.[^/.]+$/, '').replace(/[^A-Za-z0-9_-]/g, '');
+                  if (cleanName && iconName === 'time') setIconName(cleanName.substring(0, 31));
+                  handleConvert(f);
+                }
+              }}
+              className="hidden"
+            />
+
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-slate-200/80 dark:bg-slate-700/80 group-hover:bg-[#E60012]/10 flex items-center justify-center text-slate-600 dark:text-slate-300 group-hover:text-[#E60012] transition-colors">
+                <Upload className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  {file ? file.name : '点击选择或拖入 PNG / GIF 动图'}
+                </p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {file ? `${(file.size / 1024).toFixed(1)} KB · 点击可重新更换文件` : '支持透明通道 PNG 与多帧序列 GIF，自动最近邻像素化'}
+                </p>
               </div>
             </div>
+
+            <button
+              type="button"
+              onClick={e => {
+                e.stopPropagation();
+                fileInputRef.current?.click();
+              }}
+              className="px-3 py-1.5 text-xs font-semibold bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white shadow-2xs transition-colors shrink-0"
+            >
+              浏览文件
+            </button>
           </div>
 
-          {/* Grid Settings: Icon Name & Target */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {/* Form Settings Controls */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            
+            {/* Icon Name & Presets */}
             <div>
-              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                图标预设槽位:
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                图标标识名 (用于 ESP32 路径)
               </label>
-              <select
-                value={iconName}
-                onChange={e => setIconName(e.target.value)}
-                className="w-full h-9 px-3 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-[#FF6B6B]"
-              >
-                <option value="time">time (时间页角标)</option>
-                <option value="date">date (日期页角标)</option>
-                <option value="weather">weather (天气页图标)</option>
-                <option value="custom">custom (自定义命名)</option>
-              </select>
+              <div className="relative">
+                <input
+                  type="text"
+                  maxLength={31}
+                  value={iconName}
+                  onChange={e => setIconName(e.target.value)}
+                  placeholder="time, date, weather, custom"
+                  className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
+                />
+              </div>
+              <div className="flex items-center gap-1.5 mt-1.5">
+                <span className="text-[10px] text-slate-400">预设:</span>
+                {['time', 'date', 'weather', 'heart'].map(tag => (
+                  <button
+                    key={tag}
+                    type="button"
+                    onClick={() => setIconName(tag)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors ${
+                      iconName === tag 
+                        ? 'bg-[#E60012]/10 text-[#E60012] font-bold' 
+                        : 'bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-slate-800 dark:hover:text-slate-300'
+                    }`}
+                  >
+                    {tag}
+                  </button>
+                ))}
+              </div>
             </div>
 
+            {/* Frame Delay Override */}
             <div>
-              <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                自定义图标名称:
-              </label>
-              <input
-                type="text"
-                value={iconCustom}
-                disabled={iconName !== 'custom'}
-                onChange={e => setIconCustom(e.target.value)}
-                placeholder="如: heart, mario, wifi"
-                maxLength={31}
-                className="w-full h-9 px-3 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-[#FF6B6B]"
-              />
-            </div>
-          </div>
-
-          {/* Resolution & Frames */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <div>
-              <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                宽度 (W):
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                帧间隔覆盖 (毫秒，0 = 原始)
               </label>
               <input
                 type="number"
-                min="1"
-                max="32"
-                value={width}
-                onChange={e => {
-                  const val = Math.max(1, Math.min(32, Number(e.target.value) || 8));
-                  setWidth(val);
-                  if (file) processImage(file);
-                }}
-                className="w-full h-9 px-2 text-xs font-mono bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                min="0"
+                max="5000"
+                value={frameMsOverride}
+                onChange={e => setFrameMsOverride(Math.max(0, Number(e.target.value) || 0))}
+                className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
+                placeholder="0 为使用 GIF 原始延迟"
               />
+              <span className="text-[10px] text-slate-400 mt-1 block">
+                设置大于 0 则覆盖 GIF 内部帧速（如 120ms ≈ 8 FPS）
+              </span>
             </div>
 
+            {/* Max Frame limit */}
             <div>
-              <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                高度 (H):
-              </label>
-              <input
-                type="number"
-                min="1"
-                max="8"
-                value={height}
-                onChange={e => {
-                  const val = Math.max(1, Math.min(8, Number(e.target.value) || 8));
-                  setHeight(val);
-                  if (file) processImage(file);
-                }}
-                className="w-full h-9 px-2 text-xs font-mono bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
-              />
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                帧数 (Frames):
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                最大抽取帧数 (1 ~ 60)
               </label>
               <input
                 type="number"
                 min="1"
                 max="60"
-                value={frameCount}
-                onChange={e => {
-                  const val = Math.max(1, Math.min(60, Number(e.target.value) || 1));
-                  setFrameCount(val);
-                  if (file) processImage(file);
-                }}
-                className="w-full h-9 px-2 text-xs font-mono bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                value={maxFrames}
+                onChange={e => setMaxFrames(Math.max(1, Math.min(60, Number(e.target.value) || 60)))}
+                className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
               />
             </div>
 
+            {/* Optional Device IP */}
             <div>
-              <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                帧间隔 (ms):
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                设备局域网地址 (可选)
               </label>
               <input
-                type="number"
-                min="30"
-                max="5000"
-                value={frameMs}
-                onChange={e => setFrameMs(Math.max(30, Math.min(5000, Number(e.target.value) || 120)))}
-                className="w-full h-9 px-2 text-xs font-mono bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                type="text"
+                value={deviceUrl}
+                onChange={e => setDeviceUrl(e.target.value)}
+                placeholder="http://192.168.1.55"
+                className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
               />
             </div>
+
           </div>
 
-          {/* Quick preset buttons for common formats */}
-          <div className="flex flex-wrap items-center gap-1.5 pt-1">
-            <span className="text-[11px] text-slate-400">快速规格:</span>
-            {[
-              { label: '8×8 经典单角标 (time/date)', w: 8, h: 8, f: 1 },
-              { label: '8×8 动图 (4帧)', w: 8, h: 8, f: 4 },
-              { label: '32×8 全横屏动画 (6帧)', w: 32, h: 8, f: 6 },
-            ].map(preset => (
+          {/* Action Buttons Toolbar */}
+          <div className="pt-2 flex flex-wrap items-center gap-2">
+            
+            {/* Primary Convert */}
+            <button
+              onClick={() => handleConvert()}
+              disabled={isProcessing}
+              className="px-4 py-2 bg-gradient-to-r from-[#E60012] to-amber-600 hover:from-[#CC0010] hover:to-amber-700 active:scale-95 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md shadow-red-950/20 transition-all cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isProcessing ? 'animate-spin' : ''}`} />
+              <span>{isProcessing ? '正在转换...' : '执行转换'}</span>
+            </button>
+
+            {/* Load directly to Simulator */}
+            <button
+              onClick={handleLoadToSimulator}
+              disabled={frames.length === 0}
+              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+              title="将转换得到的每一帧实时载入上方 8×32 硬件时钟仿真器进行真彩连播"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>载入上方时钟</span>
+            </button>
+
+            {/* Download .NCI */}
+            <button
+              onClick={handleDownloadNci}
+              disabled={!nciBlob}
+              className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>下载 .nci 固件</span>
+            </button>
+
+            {/* Copy C++ Code */}
+            <button
+              onClick={handleCopyCppCode}
+              disabled={frames.length === 0}
+              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+            >
+              {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+              <span>{copiedCode ? '已复制' : '复制 C++ 数组'}</span>
+            </button>
+
+            {/* Push to Device */}
+            {deviceUrl.trim() && (
               <button
-                key={preset.label}
-                onClick={() => {
-                  setWidth(preset.w);
-                  setHeight(preset.h);
-                  setFrameCount(preset.f);
-                  if (file) processImage(file);
-                }}
-                className="px-2 py-0.5 text-[11px] font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded border border-slate-200 dark:border-slate-700 transition-colors"
+                onClick={handleUploadToDevice}
+                disabled={!nciBlob}
+                className="px-3 py-2 bg-blue-600/10 hover:bg-blue-600/20 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-blue-600 dark:text-blue-400 border border-blue-500/30 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
               >
-                {preset.label}
+                <Send className="w-3.5 h-3.5" />
+                <span>推送到设备</span>
               </button>
-            ))}
+            )}
+
           </div>
 
         </div>
 
-        {/* Right Preview & Action Area (5 cols) */}
-        <div className="lg:col-span-5 bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-4">
+        {/* Right Column: Hardware Pixel Simulation Preview (5 cols) */}
+        <div className="lg:col-span-5 bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 flex flex-col justify-between space-y-4">
           
-          <div className="flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-300">
-            <span>RGB565 量化点阵预览:</span>
-            <span className="text-slate-400 font-mono text-[11px]">
-              {convertedFrames.length > 0 ? `帧 ${previewFrameIdx + 1} / ${convertedFrames.length}` : '未就绪'}
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+              <Eye className="w-3.5 h-3.5 text-[#E60012]" />
+              <span>点阵屏仿真预览 ({targetWidth}×{targetHeight})</span>
             </span>
-          </div>
 
-          {/* Canvas Box */}
-          <div className="flex flex-col items-center justify-center p-3 bg-black rounded-xl border border-slate-800 min-h-[140px]">
-            <canvas
-              ref={canvasRef}
-              className="image-rendering-pixelated rounded shadow-md border border-slate-800"
-              style={{
-                width: width === 32 ? '100%' : '112px',
-                height: width === 32 ? '28px' : '112px',
-                maxWidth: '260px',
-              }}
-            />
-
-            {convertedFrames.length > 1 && (
-              <div className="flex items-center gap-2 mt-3 text-xs font-mono text-slate-400">
+            {frames.length > 1 && (
+              <div className="flex items-center gap-2 font-mono text-[11px] text-slate-500">
                 <button
-                  onClick={() => setPreviewFrameIdx(p => (p - 1 + convertedFrames.length) % convertedFrames.length)}
-                  className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
+                  onClick={() => setIsPlaying(!isPlaying)}
+                  className="px-2 py-0.5 rounded bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:text-slate-900 dark:hover:text-white flex items-center gap-1"
                 >
-                  ◀
+                  {isPlaying ? <Pause className="w-2.5 h-2.5 text-amber-500" /> : <Play className="w-2.5 h-2.5 text-emerald-500" />}
+                  <span>{isPlaying ? '暂停' : '播放'}</span>
                 </button>
-                <span>帧 #{previewFrameIdx + 1}</span>
-                <button
-                  onClick={() => setPreviewFrameIdx(p => (p + 1) % convertedFrames.length)}
-                  className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-slate-200"
-                >
-                  ▶
-                </button>
+                <span>{activeFrameIndex + 1} / {frames.length} 帧</span>
               </div>
             )}
           </div>
 
-          {/* Status message */}
-          <div className="text-[11px] text-slate-500 dark:text-slate-400 break-words font-mono bg-white dark:bg-slate-900 p-2.5 rounded-lg border border-slate-200 dark:border-slate-800">
-            {statusMessage}
-          </div>
-
-          {/* Action Buttons */}
-          <div className="space-y-2">
-            <button
-              onClick={handleDownloadNci}
-              disabled={convertedFrames.length === 0}
-              className="w-full h-10 px-4 text-xs font-bold text-white bg-gradient-to-r from-[#FF6B6B] to-[#FFA07A] hover:brightness-105 active:scale-98 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl shadow-md transition-all flex items-center justify-center gap-2"
-            >
-              <Download className="w-4 h-4" />
-              <span>下载 {targetName}.nci 二进制固件文件</span>
-            </button>
-
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={handleLoadToClock}
-                disabled={convertedFrames.length === 0}
-                className="h-9 px-3 text-xs font-semibold bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 rounded-xl text-slate-800 dark:text-slate-200 transition-colors flex items-center justify-center gap-1.5"
+          {/* Pixel LED Matrix Chassis matching top display */}
+          <div className="w-full flex items-center justify-center py-2">
+            <div className="p-3 rounded-xl bg-[#0F141E] border border-slate-800 shadow-inner w-full flex items-center justify-center">
+              <div 
+                className="grid gap-[2px] sm:gap-[3px] select-none"
+                style={{
+                  gridTemplateColumns: `repeat(${targetWidth}, minmax(0, 1fr))`,
+                  maxWidth: targetWidth === 8 ? '160px' : '100%',
+                  width: '100%'
+                }}
               >
-                <Play className="w-3.5 h-3.5 text-emerald-500" />
-                <span>载入上方时钟</span>
-              </button>
+                {Array.from({ length: targetHeight * targetWidth }).map((_, i) => {
+                  const pixel = currentFrame?.pixels?.[i] || [0, 0, 0, 0];
+                  const isTransparent = pixel[3] === 0;
+                  const bgStyle = isTransparent 
+                    ? '#121721' 
+                    : `rgb(${pixel[0]}, ${pixel[1]}, ${pixel[2]})`;
 
-              <button
-                onClick={handleCopyCppCode}
-                disabled={convertedFrames.length === 0}
-                className="h-9 px-3 text-xs font-semibold bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 rounded-xl text-slate-800 dark:text-slate-200 transition-colors flex items-center justify-center gap-1.5"
-              >
-                {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedCode ? '已复制代码' : '复制 C++ 数组'}</span>
-              </button>
+                  return (
+                    <div
+                      key={i}
+                      style={{ 
+                        backgroundColor: bgStyle,
+                        boxShadow: (!isTransparent) ? `0 0 5px 1px ${bgStyle}60` : 'none'
+                      }}
+                      className="aspect-square rounded-[2px] transition-colors duration-75 relative"
+                    />
+                  );
+                })}
+              </div>
             </div>
           </div>
 
-          {/* Direct Device Upload Option */}
-          <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
-            <div className="flex items-center gap-2 mb-1.5">
-              <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
-                无线上传至 ESP32 设备:
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={deviceIp}
-                onChange={e => setDeviceIp(e.target.value)}
-                placeholder="设备IP: 192.168.4.1"
-                className="flex-1 h-8 px-2.5 text-xs font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
-              />
-              <button
-                onClick={handleUploadToDevice}
-                disabled={convertedFrames.length === 0 || isProcessing}
-                className="h-8 px-3 text-xs font-semibold bg-slate-900 dark:bg-white text-white dark:text-slate-900 hover:opacity-90 disabled:opacity-40 rounded-lg transition-all flex items-center gap-1 whitespace-nowrap"
-              >
-                <Send className="w-3 h-3" />
-                <span>PUT 上传</span>
-              </button>
-            </div>
+          {/* Meta text banner */}
+          <div className="text-center font-mono text-[11px] text-slate-500 dark:text-slate-400 py-1.5 px-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg">
+            {metaInfo}
           </div>
 
         </div>
 
+      </div>
+
+      {/* 3. Developer Console / Progress Logs Strip */}
+      <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
+        <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-2 font-mono">
+          <div className="flex items-center gap-1.5">
+            <Terminal className="w-3.5 h-3.5 text-[#E60012]" />
+            <span className="font-semibold text-slate-700 dark:text-slate-300">转换状态终端</span>
+          </div>
+          <button
+            onClick={clearLog}
+            className="hover:text-slate-900 dark:hover:text-white transition-colors text-[11px]"
+          >
+            清空输出
+          </button>
+        </div>
+
+        <div className="bg-[#0B101A] border border-slate-800 rounded-xl p-3 min-h-[72px] max-h-32 overflow-y-auto font-mono text-[11px] text-emerald-400 space-y-1 scrollbar-thin">
+          {logs.map((log, i) => (
+            <div key={i} className="flex items-start gap-2">
+              <span className="text-slate-600 text-[10px] shrink-0">[{log.time}]</span>
+              <span className={
+                log.type === 'ok' ? 'text-emerald-400 font-medium' :
+                log.type === 'err' ? 'text-red-400 font-bold' :
+                'text-slate-300'
+              }>
+                {log.text}
+              </span>
+            </div>
+          ))}
+        </div>
       </div>
 
     </div>

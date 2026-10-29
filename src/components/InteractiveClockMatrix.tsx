@@ -6,8 +6,8 @@ import {
 } from 'lucide-react';
 import { PALETTE, PRESETS_8X32, FONT_5X3 } from '../utils/pixelPresets';
 import { 
-  makeNci, downloadNciFile, colorMatrixToRgb565Frame, generateCppRgb565Code,
-  hexToRgb565, rgb565ToHex 
+  makeNciFromHexGrids, downloadNciBlob, generateCppRgb565Code,
+  hexToRgba, hexToRgb565, rgb565ToHex, NciRawFrame 
 } from '../utils/nciFormat';
 import { NciConverterPanel } from './NciConverterPanel';
 
@@ -409,13 +409,17 @@ export const InteractiveClockMatrix: React.FC = () => {
 
     // 1. NCI RGB565 16-bit array export (Native Full-Color for ESP32 NeoClock)
     if (exportFormat === 'nci_rgb565') {
-      if (exportMode === 'animation') {
-        const rgb565Frames = animColorFrames.map(f => colorMatrixToRgb565Frame(f));
-        return generateCppRgb565Code(rgb565Frames, animTitle, 32, 8, frameDelay);
-      } else {
-        const rgb565Frame = colorMatrixToRgb565Frame(canvasColorGrid);
-        return generateCppRgb565Code([rgb565Frame], `${animTitle}_frame_${currentFrameIndex + 1}`, 32, 8, frameDelay);
-      }
+      const grids = exportMode === 'animation' ? animColorFrames : [canvasColorGrid];
+      const rawFrames: NciRawFrame[] = grids.map(g => {
+        const pixels: [number, number, number, number][] = [];
+        for (let y = 0; y < 8; y++) {
+          for (let x = 0; x < 32; x++) {
+            pixels.push(hexToRgba(g[y]?.[x] || ''));
+          }
+        }
+        return { pixels, delay: frameDelay };
+      });
+      return generateCppRgb565Code(rawFrames, animTitle, 32, 8, frameDelay);
     }
 
     // 2. Monochrome uint32 bitmask export
@@ -476,16 +480,13 @@ ${lines.join('\n')}
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
-  // Download .nci binary file directly
+  // Download .nci binary file directly (matching attachment makeNci specification)
   const handleDownloadNci = () => {
-    const framesToExport = exportMode === 'animation' 
-      ? animColorFrames.map(f => colorMatrixToRgb565Frame(f))
-      : [colorMatrixToRgb565Frame(canvasColorGrid)];
-    
+    const grids = exportMode === 'animation' ? animColorFrames : [canvasColorGrid];
     const frameDelay = Math.max(20, Math.round(1000 / animFps));
-    const nciBytes = makeNci(framesToExport, 32, 8, frameDelay);
+    const blob = makeNciFromHexGrids(grids, 32, 8, frameDelay);
     const safeName = animTitle.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, '_') || 'pixel_animation';
-    downloadNciFile(nciBytes, `${safeName}.nci`);
+    downloadNciBlob(blob, `${safeName}.nci`);
     setDownloadSuccessNci(true);
     setTimeout(() => setDownloadSuccessNci(false), 2500);
   };

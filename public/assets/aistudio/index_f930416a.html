@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NeoClock Icon Converter</title>
+<style>
+:root{--bg:#0b1020;--card:#151b2e;--line:#2b3554;--txt:#eef3ff;--sub:#9aa8c7;--acc:#49a7ff;--ok:#36d399;--err:#ff5c7a}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#081020,#121a31);color:var(--txt);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}.wrap{max-width:980px;margin:0 auto;padding:24px}.grid{display:grid;grid-template-columns:1fr 360px;gap:18px}.card{background:rgba(21,27,46,.92);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:0 12px 38px rgba(0,0,0,.28)}h1{margin:0 0 4px;font-size:24px}h2{font-size:15px;margin:0 0 12px}.sub{color:var(--sub);font-size:13px;margin:0 0 18px}.row{display:grid;gap:8px;margin:12px 0}label{font-size:12px;color:var(--sub);font-weight:700}input,select,button{font:inherit}input,select{width:100%;background:#0d1324;border:1px solid var(--line);border-radius:10px;color:var(--txt);padding:10px}button{border:0;border-radius:10px;background:var(--acc);color:#fff;padding:10px 14px;font-weight:800;cursor:pointer}button.secondary{background:#27324f}button.danger{background:#a83f5a}button:disabled{opacity:.55;cursor:not-allowed}.actions{display:flex;gap:10px;flex-wrap:wrap}.preview{display:grid;gap:12px;place-items:center}.matrix{display:grid;gap:2px;background:#050812;border:1px solid var(--line);padding:10px;border-radius:12px}.px{width:16px;height:16px;background:#000;border-radius:3px}.info{font-size:12px;color:var(--sub);line-height:1.7;word-break:break-all}.log{white-space:pre-wrap;background:#080c18;border:1px solid var(--line);border-radius:12px;padding:12px;min-height:92px;color:#c9d6ff;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.ok{color:var(--ok)}.err{color:var(--err)}canvas{display:none}@media(max-width:820px){.grid{grid-template-columns:1fr}.wrap{padding:14px}.px{width:12px;height:12px}}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>NeoClock Icon Converter</h1>
+  <p class="sub">独立工具：PNG / GIF 转 NeoClock NCI RGB565 格式。不会集成到 ESP32 配网页。</p>
+  <div class="grid">
+    <section class="card">
+      <h2>输入</h2>
+      <div class="row"><label>PNG / GIF 文件</label><input id="file" type="file" accept="image/png,image/gif"></div>
+      <div class="row"><label>目标尺寸</label><select id="size"><option value="8x8">8 x 8 图标</option><option value="32x8">32 x 8 横幅</option></select></div>
+      <div class="row"><label>GIF 帧间隔覆盖，毫秒。0 = 使用 GIF 原始延迟</label><input id="frameMs" type="number" min="0" max="5000" value="0"></div>
+      <div class="row"><label>最大帧数</label><input id="maxFrames" type="number" min="1" max="60" value="60"></div>
+      <div class="row"><label>图标名称，用于上传到 /api/v1/icons/{name}</label><input id="iconName" value="time" maxlength="31"></div>
+      <div class="row"><label>设备地址，可选，例如 http://192.168.1.55</label><input id="device" placeholder="http://192.168.1.55"></div>
+      <div class="actions">
+        <button id="convert">转换</button>
+        <button id="download" class="secondary" disabled>下载 .nci</button>
+        <button id="upload" disabled>上传到设备</button>
+      </div>
+      <p class="info">建议命名：<b>time</b> 会替换时间页图标，<b>date</b> 会替换日期页图标。NCI 内部使用 RGB565，小文件、低内存、ESP32 直接渲染。</p>
+    </section>
+    <section class="card preview">
+      <h2>预览</h2>
+      <div id="matrix" class="matrix"></div>
+      <div id="meta" class="info">尚未转换</div>
+    </section>
+  </div>
+  <section class="card" style="margin-top:18px">
+    <h2>日志</h2>
+    <div id="log" class="log"></div>
+  </section>
+</div>
+<canvas id="canvas"></canvas>
+<script>
+const $=id=>document.getElementById(id);let nciBlob=null,nciName='icon.nci',previewFrames=[],previewTimer=null;
+function log(msg,cls=''){const line=document.createElement('div');if(cls)line.className=cls;line.textContent=msg;$('log').appendChild(line)}
+function clearLog(){$('log').textContent=''}
+function rgb565(r,g,b){return ((r>>3)<<11)|((g>>2)<<5)|(b>>3)}
+function parseSize(){const [w,h]=$('size').value.split('x').map(Number);return{w,h}}
+function validName(s){return /^[A-Za-z0-9_-]{1,31}$/.test(s)}
+function makeNci(frames,w,h,frameMs){const header=12,bytes=header+frames.length*w*h*2;const buf=new ArrayBuffer(bytes);const v=new DataView(buf);v.setUint8(0,78);v.setUint8(1,67);v.setUint8(2,73);v.setUint8(3,49);v.setUint8(4,w);v.setUint8(5,h);v.setUint8(6,frames.length);v.setUint8(7,1);v.setUint16(8,frameMs,true);v.setUint16(10,0,true);let o=header;for(const fr of frames){for(let i=0;i<w*h;i++){const p=fr.pixels[i]||[0,0,0,0];const val=p[3]===0?0:rgb565(p[0],p[1],p[2]);v.setUint16(o,val,true);o+=2}}return new Blob([buf],{type:'application/octet-stream'})}
+function renderPreview(frames,w,h){previewFrames=frames;if(previewTimer)clearInterval(previewTimer);let idx=0;const m=$('matrix');m.style.gridTemplateColumns=`repeat(${w},auto)`;function draw(){m.innerHTML='';const fr=previewFrames[idx];for(const p of fr.pixels){const d=document.createElement('div');d.className='px';d.style.background=p[3]===0?'#000':`rgb(${p[0]},${p[1]},${p[2]})`;m.appendChild(d)}idx=(idx+1)%previewFrames.length}draw();if(frames.length>1)previewTimer=setInterval(draw,Math.max(30,frames[0].delay||200))}
+async function imageToFrame(file,w,h){const url=URL.createObjectURL(file);try{const img=await new Promise((res,rej)=>{const im=new Image();im.onload=()=>res(im);im.onerror=rej;im.src=url});return [drawImageToFrame(img,w,h,200)]}finally{URL.revokeObjectURL(url)}}
+function drawImageToFrame(img,w,h,delay){const c=$('canvas'),ctx=c.getContext('2d',{willReadFrequently:true});c.width=w;c.height=h;ctx.clearRect(0,0,w,h);ctx.imageSmoothingEnabled=false;ctx.drawImage(img,0,0,w,h);const d=ctx.getImageData(0,0,w,h).data,p=[];for(let i=0;i<d.length;i+=4)p.push([d[i],d[i+1],d[i+2],d[i+3]]);return{pixels:p,delay}}
+function parseGif(buf,w,h,maxFrames,overrideDelay){const b=new Uint8Array(buf);let p=0;function rd(n){const s=b.slice(p,p+n);p+=n;return s}function u16(){const v=b[p]|(b[p+1]<<8);p+=2;return v}function subBlocks(){let out=[];for(;;){const n=b[p++];if(!n)break;out.push(...b.slice(p,p+n));p+=n}return new Uint8Array(out)}function table(n){let t=[];for(let i=0;i<n;i++)t.push([b[p++],b[p++],b[p++],255]);return t}const sig=String.fromCharCode(...rd(6));if(!sig.startsWith('GIF'))throw Error('不是 GIF 文件');const sw=u16(),sh=u16(),packed=b[p++],bg=b[p++];p++;const gctFlag=packed&0x80,gctSize=2<<(packed&7);const gct=gctFlag?table(gctSize):[];let gce={delay:100,trans:null,dispose:0};let screen=new Uint8ClampedArray(sw*sh*4);if(gct[bg]){for(let i=0;i<sw*sh;i++){screen[i*4]=gct[bg][0];screen[i*4+1]=gct[bg][1];screen[i*4+2]=gct[bg][2];screen[i*4+3]=255}}const frames=[];while(p<b.length&&frames.length<maxFrames){const sep=b[p++];if(sep===0x3B)break;if(sep===0x21){const lab=b[p++];if(lab===0xF9){p++;const pk=b[p++],del=u16()*10,tr=b[p++];p++;gce={delay:overrideDelay||Math.max(30,del||100),trans:(pk&1)?tr:null,dispose:(pk>>2)&7}}else subBlocks();continue}if(sep!==0x2C)throw Error('GIF 块格式不支持');const ix=u16(),iy=u16(),iw=u16(),ih=u16(),ip=b[p++];const lct=ip&0x80?table(2<<(ip&7)):null,inter=!!(ip&0x40),ct=lct||gct;const min=b[p++],data=subBlocks();const idx=lzwDecode(min,data,iw*ih);const prev=screen.slice();let order=[];if(inter){for(const [st,step] of [[0,8],[4,8],[2,4],[1,2]])for(let y=st;y<ih;y+=step)order.push(y)}else for(let y=0;y<ih;y++)order.push(y);let k=0;for(const y of order){for(let x=0;x<iw;x++,k++){const ci=idx[k];if(ci===undefined)continue;if(gce.trans!==null&&ci===gce.trans)continue;const col=ct[ci]||[0,0,0,255];const sx=ix+x,sy=iy+y;if(sx<0||sy<0||sx>=sw||sy>=sh)continue;const o=(sy*sw+sx)*4;screen[o]=col[0];screen[o+1]=col[1];screen[o+2]=col[2];screen[o+3]=255}}frames.push(scaleRgba(screen,sw,sh,w,h,gce.delay));if(gce.dispose===2){for(let y=iy;y<iy+ih;y++)for(let x=ix;x<ix+iw;x++){if(x<0||y<0||x>=sw||y>=sh)continue;const o=(y*sw+x)*4;screen[o]=screen[o+1]=screen[o+2]=0;screen[o+3]=0}}else if(gce.dispose===3)screen=prev;gce={delay:100,trans:null,dispose:0}}return frames}
+function lzwDecode(min,data,limit){let pos=0;function code(size){let c=0;for(let i=0;i<size;i++){if(data[pos>>3]&(1<<(pos&7)))c|=1<<i;pos++}return c}const clear=1<<min,end=clear+1;let size=min+1,dict=[],out=[];function reset(){dict=[];for(let i=0;i<clear;i++)dict[i]=[i];dict[clear]=[];dict[end]=null;size=min+1}reset();let prev=null;for(;;){let c=code(size);if(c===clear){reset();prev=null;continue}if(c===end||out.length>=limit)break;let entry=dict[c]?dict[c].slice():(prev?prev.concat(prev[0]):[]);out.push(...entry);if(prev){dict.push(prev.concat(entry[0]));if(dict.length===(1<<size)&&size<12)size++}prev=entry}return out.slice(0,limit)}
+function scaleRgba(rgba,sw,sh,w,h,delay){const pixels=[];for(let y=0;y<h;y++)for(let x=0;x<w;x++){const sx=Math.min(sw-1,Math.floor(x*sw/w)),sy=Math.min(sh-1,Math.floor(y*sh/h)),o=(sy*sw+sx)*4;pixels.push([rgba[o],rgba[o+1],rgba[o+2],rgba[o+3]])}return{pixels,delay}}
+async function convert(){clearLog();const f=$('file').files[0];if(!f){log('请选择 PNG 或 GIF','err');return}const {w,h}=parseSize(),max=Math.max(1,Math.min(60,Number($('maxFrames').value)||60)),ov=Math.max(0,Number($('frameMs').value)||0);let frames;if(f.type==='image/gif'||f.name.toLowerCase().endsWith('.gif')){log('解析 GIF...');frames=parseGif(await f.arrayBuffer(),w,h,max,ov)}else{log('解析静态图片...');frames=await imageToFrame(f,w,h)}if(!frames.length)throw Error('没有生成任何帧');const frameMs=ov||frames[0].delay||200;nciBlob=makeNci(frames,w,h,frameMs);const base=($('iconName').value||'icon').replace(/[^A-Za-z0-9_-]/g,'')||'icon';nciName=base+'.nci';renderPreview(frames,w,h);$('meta').textContent=`${w}x${h}, ${frames.length} frame(s), frameMs=${frameMs}, NCI=${nciBlob.size} bytes`;$('download').disabled=false;$('upload').disabled=false;log('转换完成','ok')}
+$('convert').onclick=()=>convert().catch(e=>log(e.message||String(e),'err'));
+$('download').onclick=()=>{if(!nciBlob)return;const a=document.createElement('a');a.href=URL.createObjectURL(nciBlob);a.download=nciName;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+$('upload').onclick=async()=>{try{if(!nciBlob)throw Error('请先转换');const dev=$('device').value.replace(/\/$/,'');const name=$('iconName').value.trim();if(!dev)throw Error('请输入设备地址');if(!validName(name))throw Error('图标名称只能包含字母、数字、_、-，长度 1..31');const r=await fetch(dev+'/api/v1/icons/'+encodeURIComponent(name),{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:nciBlob});const t=await r.text();if(!r.ok)throw Error(t);log('上传成功: '+name,'ok')}catch(e){log('上传失败: '+(e.message||e),'err')}};
+</script>
+</body>
+</html>
