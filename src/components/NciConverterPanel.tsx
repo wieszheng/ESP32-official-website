@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   FileCode, Upload, Download, Copy, Check, Play, Pause,
-  Layers, Eye, Send, Terminal, Sparkles, RefreshCw, X, ArrowUpRight
+  Layers, Eye, Send, Terminal, Sparkles, RefreshCw, X, ArrowUpRight, Wifi
 } from 'lucide-react';
 import { 
   makeNci, fileToNciFrames, downloadNciBlob, generateCppRgb565Code,
@@ -35,6 +35,8 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [isTestingDevice, setIsTestingDevice] = useState<boolean>(false);
+  const [deviceTestResult, setDeviceTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([
     { text: '转换引擎已就绪：支持解析标准 PNG 及多帧 GIF 动图', type: 'info', time: 'SYS' }
   ]);
@@ -159,29 +161,129 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
+  // Helper to normalize device URL (auto-prepend http:// if user wrote 192.168.x.x)
+  const getNormalizedDeviceUrl = (raw: string): string => {
+    let clean = raw.trim().replace(/\/$/, '');
+    if (!clean) return '';
+    if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
+      clean = 'http://' + clean;
+    }
+    return clean;
+  };
+
+  // Test connection to local ESP32 device
+  const handleTestDevice = async () => {
+    const cleanDev = getNormalizedDeviceUrl(deviceUrl);
+    if (!cleanDev) {
+      addLog('请输入有效的设备 IP 地址（例如 192.168.1.55 或 192.168.4.1）', 'err');
+      return;
+    }
+
+    setIsTestingDevice(true);
+    setDeviceTestResult(null);
+    addLog(`正在探测设备连通性: ${cleanDev} ...`, 'info');
+
+    try {
+      // 1. Try local Express backend ping proxy (bypasses browser CORS & mixed-content blocks)
+      const res = await fetch(`/api/ping-device?url=${encodeURIComponent(cleanDev)}`);
+      const data = await res.json().catch(() => null);
+
+      if (data?.reachable) {
+        setDeviceTestResult({ ok: true, msg: `连接正常 (${data.latencyMs}ms)` });
+        addLog(`✅ 设备在线！${cleanDev} 响应正常，延迟 ${data.latencyMs}ms (HTTP ${data.status})`, 'ok');
+        return;
+      }
+
+      // 2. Fallback: try browser direct fetch
+      try {
+        const directStart = Date.now();
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 2500);
+        await fetch(`${cleanDev}/api/v1/status`, { method: 'GET', mode: 'no-cors', signal: controller.signal });
+        clearTimeout(t);
+        setDeviceTestResult({ ok: true, msg: `直连可达 (${Date.now() - directStart}ms)` });
+        addLog(`✅ 浏览器直连可达: ${cleanDev} (${Date.now() - directStart}ms)`, 'ok');
+      } catch (directErr: any) {
+        setDeviceTestResult({ ok: false, msg: '未响应或离线' });
+        addLog(
+          `❌ 无法连接到 ${cleanDev}。请检查：1. ESP32 是否已开机联网；2. 电脑/手机与 ESP32 是否在同一局域网 WiFi。`,
+          'err'
+        );
+      }
+    } catch (e: any) {
+      setDeviceTestResult({ ok: false, msg: '测试失败' });
+      addLog(`测试异常: ${e.message || String(e)}`, 'err');
+    } finally {
+      setIsTestingDevice(false);
+    }
+  };
+
   // Upload to ESP32 device via HTTP PUT /api/v1/icons/{name}
+  // Supports both local backend proxy (bypasses browser CORS / Mixed Content) and direct browser fetch
   const handleUploadToDevice = async () => {
     try {
       if (!nciBlob) throw new Error('请先转换图片生成 NCI 固件');
-      const dev = deviceUrl.trim().replace(/\/$/, '');
+      const cleanDev = getNormalizedDeviceUrl(deviceUrl);
       const name = iconName.trim();
-      if (!dev) throw new Error('请输入设备地址（例如 http://192.168.1.55）');
+      if (!cleanDev) throw new Error('请输入设备地址（例如 192.168.1.55 或 http://192.168.1.55）');
       if (!validName(name)) throw new Error('图标名称只能包含字母、数字、_、-，长度 1..31');
 
-      addLog(`正在推送到设备: ${dev}/api/v1/icons/${encodeURIComponent(name)} ...`, 'info');
+      const targetEndpoint = `${cleanDev}/api/v1/icons/${encodeURIComponent(name)}`;
+      addLog(`正在推送到设备: ${targetEndpoint} ...`, 'info');
 
-      const res = await fetch(`${dev}/api/v1/icons/${encodeURIComponent(name)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: nciBlob,
-      });
+      let uploadedSuccessfully = false;
+      let lastErrMsg = '';
 
-      const txt = await res.text();
-      if (!res.ok) throw new Error(txt || `HTTP ${res.status}`);
+      // Strategy 1: Attempt via Server-side Proxy (/api/proxy-device)
+      // This bypasses browser CORS, Private Network Access (PNA), and Mixed-Content (HTTPS->HTTP) blocks!
+      try {
+        const proxyRes = await fetch('/api/proxy-device', {
+          method: 'POST',
+          headers: {
+            'x-target-url': targetEndpoint,
+            'x-target-method': 'PUT',
+            'Content-Type': 'application/octet-stream',
+          },
+          body: nciBlob,
+        });
 
-      addLog(`上传成功！ESP32 设备图标已更新至 /api/v1/icons/${name}`, 'ok');
+        if (proxyRes.ok) {
+          uploadedSuccessfully = true;
+          addLog(`✅ 上传成功！图标已通过本地代理推送至 ESP32 (${cleanDev}/api/v1/icons/${name})`, 'ok');
+        } else {
+          const errData = await proxyRes.json().catch(() => null);
+          lastErrMsg = errData?.error || `HTTP ${proxyRes.status}`;
+        }
+      } catch (proxyErr: any) {
+        lastErrMsg = proxyErr.message || String(proxyErr);
+      }
+
+      // Strategy 2: If proxy could not reach target, attempt direct browser fetch fallback!
+      if (!uploadedSuccessfully) {
+        addLog(`正在尝试浏览器局域网直连推送...`, 'info');
+        try {
+          const directRes = await fetch(targetEndpoint, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: nciBlob,
+          });
+
+          if (directRes.ok) {
+            uploadedSuccessfully = true;
+            addLog(`✅ 直连上传成功！ESP32 设备图标已更新至 /api/v1/icons/${name}`, 'ok');
+          } else {
+            const txt = await directRes.text().catch(() => '');
+            throw new Error(txt || `HTTP ${directRes.status}`);
+          }
+        } catch (directErr: any) {
+          throw new Error(
+            `无法上传到设备 (${cleanDev})：${directErr.message || lastErrMsg}。\n` +
+            `👉 解决建议：1. 确认设备 IP 是否正确且开机；2. 确认当前电脑/手机与 ESP32 在同一局域网；3. 可直接点击下方「下载 .nci 固件」并在 NeoClock 后台直接导入。`
+          );
+        }
+      }
     } catch (err: any) {
-      addLog(`上传失败: ${err.message || String(err)}（请确认当前网络已接入 NeoClock 热点）`, 'err');
+      addLog(`上传失败: ${err.message || String(err)}`, 'err');
     }
   };
 
@@ -381,17 +483,49 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
             </div>
 
             {/* Optional Device IP */}
-            <div>
-              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-                设备局域网地址 (可选)
-              </label>
-              <input
-                type="text"
-                value={deviceUrl}
-                onChange={e => setDeviceUrl(e.target.value)}
-                placeholder="http://192.168.1.55"
-                className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
-              />
+            <div className="md:col-span-2">
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="font-semibold text-slate-700 dark:text-slate-300 text-xs flex items-center gap-1.5">
+                  <Wifi className="w-3.5 h-3.5 text-blue-500" />
+                  <span>ESP32 局域网推送地址 (可选)</span>
+                </label>
+                {deviceTestResult && (
+                  <span className={`text-[11px] font-medium px-2 py-0.5 rounded-full ${
+                    deviceTestResult.ok 
+                      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20'
+                      : 'bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20'
+                  }`}>
+                    {deviceTestResult.msg}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1">
+                  <input
+                    type="text"
+                    value={deviceUrl}
+                    onChange={e => {
+                      setDeviceUrl(e.target.value);
+                      if (deviceTestResult) setDeviceTestResult(null);
+                    }}
+                    placeholder="例如 192.168.1.55 或 192.168.4.1"
+                    className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={handleTestDevice}
+                  disabled={isTestingDevice || !deviceUrl.trim()}
+                  className="px-3 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1 transition-all whitespace-nowrap cursor-pointer"
+                  title="探测局域网内 ESP32 设备是否在线并测试响应延迟"
+                >
+                  <RefreshCw className={`w-3 h-3 ${isTestingDevice ? 'animate-spin text-blue-500' : ''}`} />
+                  <span>{isTestingDevice ? '探测中...' : '测速连接'}</span>
+                </button>
+              </div>
+              <span className="text-[10px] text-slate-400 mt-1 block">
+                支持直接输入 IP（如 192.168.1.55 或 192.168.4.1），内置服务端代理已自动穿透浏览器跨域与私网(PNA)隔离。
+              </span>
             </div>
 
           </div>
@@ -492,7 +626,7 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
               >
                 {Array.from({ length: targetHeight * targetWidth }).map((_, i) => {
                   const pixel = currentFrame?.pixels?.[i] || [0, 0, 0, 0];
-                  const isTransparent = pixel[3] === 0;
+                  const isTransparent = (!pixel[3] || pixel[3] < 64);
                   const bgStyle = isTransparent 
                     ? '#121721' 
                     : `rgb(${pixel[0]}, ${pixel[1]}, ${pixel[2]})`;

@@ -10,6 +10,7 @@ import {
   hexToRgba, hexToRgb565, rgb565ToHex, NciRawFrame 
 } from '../utils/nciFormat';
 import { NciConverterPanel } from './NciConverterPanel';
+import { PixelPalettePicker } from './PixelPalettePicker';
 
 export type MatrixDisplayMode = 'clock' | 'weather' | 'visualizer' | 'crypto' | 'draw' | 'anim';
 
@@ -921,6 +922,20 @@ ${lines.join('\n')}
             </button>
           </div>
 
+          {/* Quick Palette Bar on Simulator Chassis (Active in Draw or Anim mode) */}
+          {(mode === 'draw' || mode === 'anim') && (
+            <div className="mt-4 max-w-4xl mx-auto">
+              <PixelPalettePicker
+                variant="compact"
+                selectedColor={selectedColor}
+                onSelectColor={color => {
+                  setSelectedColor(color);
+                  if (mode !== 'anim' && mode !== 'draw') setMode('draw');
+                }}
+              />
+            </div>
+          )}
+
           {/* Quick optical controls */}
           <div className="mt-4 flex flex-wrap items-center justify-center gap-6 text-xs text-slate-500 dark:text-slate-400">
             <div className="flex items-center gap-2">
@@ -1209,56 +1224,37 @@ ${lines.join('\n')}
             </div>
           </div>
 
-          {/* 3. Manual Touch-up Canvas & Code Export Strip */}
+          {/* 3. Dedicated Pixel Palette Component (Full Workbench Variant) */}
+          <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
+            <PixelPalettePicker
+              variant="full"
+              selectedColor={selectedColor}
+              onSelectColor={color => {
+                setSelectedColor(color);
+                if (mode !== 'anim') setMode('draw');
+              }}
+              onClearCanvas={handleClearCanvas}
+            />
+          </div>
+
+          {/* 4. Presets Loader & Code Export Strip */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start pt-2 border-t border-slate-200 dark:border-slate-800">
             <div>
               {/* Presets loader */}
-              <div className="mb-4">
+              <div>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">快速载入经典点阵预设:</span>
-                  <span className="text-[11px] text-slate-400">单帧覆盖</span>
+                  <span className="text-[11px] text-slate-400">覆盖当前帧</span>
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   {Object.entries(PRESETS_8X32).map(([key, item]) => (
                     <button
                       key={key}
                       onClick={() => handleLoadPreset(key)}
-                      className="px-2.5 py-1.5 text-xs font-medium bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-200 dark:border-slate-700 rounded-lg text-center transition-colors truncate"
+                      className="px-2.5 py-1.5 text-xs font-medium bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-200 dark:border-slate-700 rounded-lg text-center transition-colors truncate cursor-pointer"
                     >
                       {item.name}
                     </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Color Palette Picker for Drawing */}
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    点阵画笔色调 (支持在上方屏幕直接涂抹):
-                  </span>
-                  <button
-                    onClick={handleClearCanvas}
-                    className="text-xs text-slate-500 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 flex items-center gap-1 transition-colors"
-                  >
-                    <RotateCcw className="w-3 h-3" />
-                    <span>清空当前帧</span>
-                  </button>
-                </div>
-                <div className="flex flex-wrap gap-1.5 p-2 bg-slate-50 dark:bg-slate-950/60 rounded-lg border border-slate-200 dark:border-slate-800">
-                  {PALETTE.slice(1).map(color => (
-                    <button
-                      key={color}
-                      onClick={() => {
-                        setSelectedColor(color);
-                        if (mode !== 'anim') setMode('draw');
-                      }}
-                      className={`w-6 h-6 rounded-md transition-all ${
-                        selectedColor === color ? 'ring-2 ring-slate-900 dark:ring-white scale-110' : 'hover:scale-105'
-                      }`}
-                      style={{ backgroundColor: color }}
-                      title={color}
-                    />
                   ))}
                 </div>
               </div>

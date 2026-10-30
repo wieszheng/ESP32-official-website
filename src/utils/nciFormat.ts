@@ -100,7 +100,8 @@ export function makeNci(frames: NciRawFrame[], w: number, h: number, frameMs: nu
   for (const fr of frames) {
     for (let i = 0; i < w * h; i++) {
       const p = fr.pixels[i] || [0, 0, 0, 0];
-      const val = p[3] === 0 ? 0 : rgb565(p[0], p[1], p[2]);
+      // Transparency threshold: alpha 0 or < 64 is transparent (0x0000 in RGB565)
+      const val = (!p[3] || p[3] < 64) ? 0 : rgb565(p[0], p[1], p[2]);
       v.setUint16(o, val, true);
       o += 2;
     }
@@ -183,7 +184,13 @@ export function scaleRgba(
       const sx = Math.min(sw - 1, Math.floor(x * sw / w));
       const sy = Math.min(sh - 1, Math.floor(y * sh / h));
       const o = (sy * sw + sx) * 4;
-      pixels.push([rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]]);
+      const a = rgba[o + 3];
+      // Transparency threshold: any alpha < 64 is treated as fully transparent [0, 0, 0, 0]
+      if (!a || a < 64) {
+        pixels.push([0, 0, 0, 0]);
+      } else {
+        pixels.push([rgba[o], rgba[o + 1], rgba[o + 2], 255]);
+      }
     }
   }
   return { pixels, delay };
@@ -302,16 +309,10 @@ export function parseGif(
   const gct = gctFlag ? table(gctSize) : [];
 
   let gce = { delay: 100, trans: null as number | null, dispose: 0 };
+  // Screen buffer: explicitly initialized to transparent (R=0, G=0, B=0, A=0).
+  // Note: Do NOT pre-fill with gct[bg] when transparency is used or on icon conversion,
+  // otherwise transparent pixels in the first frame will be contaminated with background color alpha=255.
   let screen = new Uint8ClampedArray(sw * sh * 4);
-
-  if (gct[bg]) {
-    for (let i = 0; i < sw * sh; i++) {
-      screen[i * 4] = gct[bg][0];
-      screen[i * 4 + 1] = gct[bg][1];
-      screen[i * 4 + 2] = gct[bg][2];
-      screen[i * 4 + 3] = 255;
-    }
-  }
 
   const frames: NciRawFrame[] = [];
 
@@ -370,12 +371,24 @@ export function parseGif(
       for (let x = 0; x < iw; x++, k++) {
         const ci = idx[k];
         if (ci === undefined) continue;
-        if (gce.trans !== null && ci === gce.trans) continue;
-        const col = ct[ci] || [0, 0, 0, 255];
         const sx = ix + x;
         const sy = iy + y;
         if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) continue;
         const o = (sy * sw + sx) * 4;
+
+        // Transparent pixel handling:
+        // On first frame (frames.length === 0) or dispose === 2, transparent index must have alpha = 0.
+        if (gce.trans !== null && ci === gce.trans) {
+          if (frames.length === 0 || gce.dispose === 2) {
+            screen[o] = 0;
+            screen[o + 1] = 0;
+            screen[o + 2] = 0;
+            screen[o + 3] = 0;
+          }
+          continue;
+        }
+
+        const col = ct[ci] || [0, 0, 0, 255];
         screen[o] = col[0];
         screen[o + 1] = col[1];
         screen[o + 2] = col[2];
@@ -386,7 +399,7 @@ export function parseGif(
     frames.push(scaleRgba(screen, sw, sh, w, h, gce.delay));
 
     if (gce.dispose === 2) {
-      // Restore to background
+      // Restore to background (transparent)
       for (let y = iy; y < iy + ih; y++) {
         for (let x = ix; x < ix + iw; x++) {
           if (x < 0 || y < 0 || x >= sw || y >= sh) continue;
@@ -424,7 +437,12 @@ export function drawImageToFrame(img: HTMLImageElement, w: number, h: number, de
   const d = ctx.getImageData(0, 0, w, h).data;
   const pixels: [number, number, number, number][] = [];
   for (let i = 0; i < d.length; i += 4) {
-    pixels.push([d[i], d[i + 1], d[i + 2], d[i + 3]]);
+    const a = d[i + 3];
+    if (!a || a < 64) {
+      pixels.push([0, 0, 0, 0]);
+    } else {
+      pixels.push([d[i], d[i + 1], d[i + 2], 255]);
+    }
   }
 
   return { pixels, delay };
@@ -477,7 +495,8 @@ export function nciRawFrameToHexGrid(frame: NciRawFrame, w: number, h: number): 
     const row: string[] = [];
     for (let x = 0; x < w; x++) {
       const p = frame.pixels[idx++] || [0, 0, 0, 0];
-      if (p[3] === 0) {
+      const isTransparent = (!p[3] || p[3] < 64);
+      if (isTransparent) {
         row.push('#121721'); // unlit black
       } else {
         const hex = `#${p[0].toString(16).padStart(2, '0')}${p[1].toString(16).padStart(2, '0')}${p[2].toString(16).padStart(2, '0')}`.toUpperCase();
@@ -524,7 +543,8 @@ export function generateCppRgb565Code(
       const chunk: string[] = [];
       for (let j = 0; j < step; j++) {
         const p = frame.pixels[i + j] || [0, 0, 0, 0];
-        const val = p[3] === 0 ? 0 : rgb565(p[0], p[1], p[2]);
+        const isTransparent = (!p[3] || p[3] < 64);
+        const val = isTransparent ? 0 : rgb565(p[0], p[1], p[2]);
         chunk.push(`0x${val.toString(16).padStart(4, '0').toUpperCase()}`);
       }
       hexLines.push(`    ${chunk.join(', ')}`);

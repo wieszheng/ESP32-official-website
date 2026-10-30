@@ -12,6 +12,9 @@ export default defineConfig(() => {
       },
     },
     server: {
+      host: '0.0.0.0', // Listen on all network interfaces including 192.168.x.x
+      allowedHosts: true as const, // Allow direct access from any IP/host like 192.168.x.x
+      cors: true,
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',

@@ -27,6 +27,105 @@ const PORT = getPort();
 
 app.use(express.json());
 
+// Enable full CORS, Private Network Access (PNA), and local IP access (192.168.x.x, 10.x.x.x, localhost)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-target-url, x-target-method');
+  res.header('Access-Control-Allow-Private-Network', 'true');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+// Proxy endpoint to communicate with local ESP32 devices (e.g. http://192.168.x.x)
+// Solves browser CORS, Private Network Access (PNA), and Mixed Content (HTTPS -> HTTP) blocks
+app.all(
+  '/api/proxy-device',
+  express.raw({ type: ['application/octet-stream', 'application/*', '*/*'], limit: '20mb' }),
+  async (req, res) => {
+    let targetUrl = (req.headers['x-target-url'] || req.query.url) as string;
+    if (!targetUrl) {
+      return res.status(400).json({ error: '缺少目标设备地址 (x-target-url 标头或 url 参数)' });
+    }
+
+    targetUrl = targetUrl.trim();
+    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+      targetUrl = 'http://' + targetUrl;
+    }
+
+    try {
+      const parsed = new URL(targetUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return res.status(400).json({ error: '仅支持 HTTP / HTTPS 协议' });
+      }
+
+      const method = (req.headers['x-target-method'] as string) || req.method || 'GET';
+      const forwardHeaders: Record<string, string> = {};
+      if (req.headers['content-type']) {
+        forwardHeaders['Content-Type'] = req.headers['content-type'];
+      }
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      const hasBody = !['GET', 'HEAD'].includes(method.toUpperCase());
+      const deviceRes = await fetch(targetUrl, {
+        method: method.toUpperCase(),
+        headers: forwardHeaders,
+        body: hasBody ? req.body : undefined,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      const responseBuffer = await deviceRes.arrayBuffer();
+      res.status(deviceRes.status);
+      const ct = deviceRes.headers.get('content-type');
+      if (ct) res.setHeader('Content-Type', ct);
+      res.setHeader('x-proxied-by', 'neoclock-express');
+      return res.send(Buffer.from(responseBuffer));
+    } catch (err: any) {
+      const isTimeout = err.name === 'AbortError' || err.message?.includes('aborted');
+      console.warn(`[Proxy-Device Error] ${targetUrl}:`, err.message);
+      return res.status(502).json({
+        error: isTimeout ? '连接设备超时 (8秒)，请检查设备 IP 是否正确且在线' : `连接设备失败: ${err.message}`,
+        targetUrl,
+      });
+    }
+  }
+);
+
+// Ping test helper for local devices
+app.get('/api/ping-device', async (req, res) => {
+  let target = (req.query.url as string || '').trim();
+  if (!target) return res.status(400).json({ reachable: false, error: '缺少 IP 或 URL' });
+  if (!target.startsWith('http://') && !target.startsWith('https://')) {
+    target = 'http://' + target;
+  }
+  const start = Date.now();
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const r = await fetch(target, { method: 'GET', signal: controller.signal });
+    clearTimeout(timeout);
+    return res.json({
+      reachable: true,
+      status: r.status,
+      latencyMs: Date.now() - start,
+      target,
+    });
+  } catch (err: any) {
+    return res.json({
+      reachable: false,
+      error: err.message,
+      latencyMs: Date.now() - start,
+      target,
+    });
+  }
+});
+
 // Initialize GoogleGenAI client with telemetry header
 const getGenAIClient = () => {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -421,7 +520,12 @@ async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { 
+        middlewareMode: true,
+        host: '0.0.0.0',
+        allowedHosts: true,
+        cors: true,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
