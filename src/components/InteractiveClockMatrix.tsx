@@ -2,14 +2,17 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Clock, CloudSun, Activity, TrendingUp, Palette, 
   RotateCcw, Copy, Check, Sparkles, Sliders, Play, Pause,
-  SkipBack, SkipForward, Plus, Trash2, Wand2, Film, Loader2, Download
+  SkipBack, SkipForward, Plus, Trash2, Wand2, Film, Loader2, Download,
+  ArrowDownToLine, FileCode
 } from 'lucide-react';
 import { PALETTE, PRESETS_8X32, FONT_5X3 } from '../utils/pixelPresets';
 import { 
-  makeNciFromHexGrids, downloadNciBlob, generateCppRgb565Code,
-  hexToRgba, hexToRgb565, rgb565ToHex, NciRawFrame 
+  buildNciByVersion, downloadNciBlob, generateCppRgb565Code,
+  hexToRgba, normalizeNci2FrameDelay, NciRawFrame, NciFormatVersion
 } from '../utils/nciFormat';
-import { NciConverterPanel } from './NciConverterPanel';
+import { 
+  NciConverterPanel, NciSimulatorLoadPayload, NciWritebackPayload 
+} from './NciConverterPanel';
 import { PixelPalettePicker } from './PixelPalettePicker';
 
 export type MatrixDisplayMode = 'clock' | 'weather' | 'visualizer' | 'crypto' | 'draw' | 'anim';
@@ -88,6 +91,7 @@ export const InteractiveClockMatrix: React.FC = () => {
   });
   const [selectedColor, setSelectedColor] = useState<string>('#E60012');
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
+  const drawActionRef = useRef<'paint' | 'erase'>('paint');
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [downloadSuccessNci, setDownloadSuccessNci] = useState<boolean>(false);
   
@@ -98,6 +102,7 @@ export const InteractiveClockMatrix: React.FC = () => {
   const [animTitle, setAnimTitle] = useState<string>('全彩跃动篝火 (Campfire Flame)');
   const [animColorFrames, setAnimColorFrames] = useState<string[][][]>(DEFAULT_ANIM_COLOR_FRAMES);
   const [animFrames, setAnimFrames] = useState<string[][]>(DEFAULT_ANIM_FRAMES);
+  const [animFrameDelays, setAnimFrameDelays] = useState<number[] | null>(null);
   const [currentFrameIndex, setCurrentFrameIndex] = useState<number>(0);
   const [isPlayingAnimation, setIsPlayingAnimation] = useState<boolean>(true);
   const [animFps, setAnimFps] = useState<number>(6);
@@ -106,9 +111,32 @@ export const InteractiveClockMatrix: React.FC = () => {
   const [isGeneratingAI, setIsGeneratingAI] = useState<boolean>(false);
   const [exportMode, setExportMode] = useState<'animation' | 'single'>('animation');
   const [exportFormat, setExportFormat] = useState<'nci_rgb565' | 'bitmap_uint32'>('nci_rgb565');
+  const [nciExportVersion, setNciExportVersion] = useState<NciFormatVersion>('NCI2');
+  const [nciExportSize, setNciExportSize] = useState<'8x8' | '32x8'>('32x8');
   const [generationFeedback, setGenerationFeedback] = useState<string | null>(null);
   const [aiMeta, setAiMeta] = useState<{ model: string; isRealAI: boolean; latencyMs: number } | null>(null);
   const [modelStatus, setModelStatus] = useState<{ connected: boolean; model: string; provider: string } | null>(null);
+
+  // --- NCI Round-Trip Editing Session ---
+  const [nciSession, setNciSession] = useState<{
+    iconName: string;
+    targetWidth: 8 | 32;
+    targetHeight: 8;
+    originalFrameMs: number;
+    initialFps: number;
+    cropOffsetX: number;
+    version: NciFormatVersion;
+  } | null>(null);
+  const [nciWriteback, setNciWriteback] = useState<NciWritebackPayload | null>(null);
+  const [writebackSuccess, setWritebackSuccess] = useState<boolean>(false);
+  const [hasUnsyncedEdits, setHasUnsyncedEdits] = useState<boolean>(false);
+
+  // Release drawing state if mouse released anywhere on window
+  useEffect(() => {
+    const handleGlobalMouseUp = () => setIsDrawing(false);
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+    return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
+  }, []);
 
   // Check model connectivity on mount
   useEffect(() => {
@@ -139,25 +167,26 @@ export const InteractiveClockMatrix: React.FC = () => {
     return () => clearInterval(interval);
   }, [mode]);
 
-  // Timeline Player Timer for Animation Mode
+  // Timeline Player Timer for Animation Mode (supports VARTIME per-frame delays)
   useEffect(() => {
     if (!isPlayingAnimation || animColorFrames.length === 0) return;
 
-    const delayMs = Math.max(50, Math.round(1000 / animFps));
-    const interval = setInterval(() => {
-      setCurrentFrameIndex(prev => {
-        const next = (prev + 1) % animColorFrames.length;
-        // Keep canvas in sync if user is viewing anim mode
-        if (mode === 'anim' || mode === 'draw') {
-          if (animColorFrames[next]) setCanvasColorGrid(animColorFrames[next]);
-          if (animFrames[next]) setCanvasGrid(animFrames[next]);
-        }
-        return next;
-      });
+    const currentVarDelay = animFrameDelays?.[currentFrameIndex];
+    const delayMs = currentVarDelay && currentVarDelay >= 30
+      ? currentVarDelay
+      : Math.max(50, Math.round(1000 / animFps));
+
+    const timer = setTimeout(() => {
+      const next = (currentFrameIndex + 1) % animColorFrames.length;
+      setCurrentFrameIndex(next);
+      if (mode === 'anim' || mode === 'draw') {
+        if (animColorFrames[next]) setCanvasColorGrid(animColorFrames[next]);
+        if (animFrames[next]) setCanvasGrid(animFrames[next]);
+      }
     }, delayMs);
 
-    return () => clearInterval(interval);
-  }, [isPlayingAnimation, animFps, animColorFrames.length, animFrames, mode]);
+    return () => clearTimeout(timer);
+  }, [isPlayingAnimation, animFps, animFrameDelays, currentFrameIndex, animColorFrames, animFrames, mode]);
 
   // AI Animation Generation API Call
   const handleGenerateAIAnimation = async (customPrompt?: string) => {
@@ -201,6 +230,7 @@ export const InteractiveClockMatrix: React.FC = () => {
 
         setAnimColorFrames(colorGrids);
         setAnimFrames(data.frames);
+        setAnimFrameDelays(null);
         setAnimTitle(data.title || query);
         setAnimFps(data.recommendedFps || 6);
         setCurrentFrameIndex(0);
@@ -246,9 +276,13 @@ export const InteractiveClockMatrix: React.FC = () => {
     const updatedMono = [...animFrames, blankMono];
     setAnimColorFrames(updatedColor);
     setAnimFrames(updatedMono);
+    if (animFrameDelays) {
+      setAnimFrameDelays([...animFrameDelays, animFrameDelays[currentFrameIndex] || 200]);
+    }
     setCurrentFrameIndex(updatedColor.length - 1);
     setCanvasColorGrid(blankColor);
     setCanvasGrid(blankMono);
+    setHasUnsyncedEdits(true);
   };
 
   const handleDuplicateFrame = () => {
@@ -266,7 +300,16 @@ export const InteractiveClockMatrix: React.FC = () => {
     ];
     setAnimColorFrames(updatedColor);
     setAnimFrames(updatedMono);
+    if (animFrameDelays) {
+      const curD = animFrameDelays[currentFrameIndex] || 200;
+      setAnimFrameDelays([
+        ...animFrameDelays.slice(0, currentFrameIndex + 1),
+        curD,
+        ...animFrameDelays.slice(currentFrameIndex + 1),
+      ]);
+    }
     setCurrentFrameIndex(currentFrameIndex + 1);
+    setHasUnsyncedEdits(true);
   };
 
   const handleDeleteFrame = (idx: number, e: React.MouseEvent) => {
@@ -276,10 +319,14 @@ export const InteractiveClockMatrix: React.FC = () => {
     const updatedMono = animFrames.filter((_, i) => i !== idx);
     setAnimColorFrames(updatedColor);
     setAnimFrames(updatedMono);
+    if (animFrameDelays) {
+      setAnimFrameDelays(animFrameDelays.filter((_, i) => i !== idx));
+    }
     const nextIdx = Math.min(idx, updatedColor.length - 1);
     setCurrentFrameIndex(nextIdx);
     setCanvasColorGrid(updatedColor[nextIdx]);
     setCanvasGrid(updatedMono[nextIdx]);
+    setHasUnsyncedEdits(true);
   };
 
   // Load preset to canvas
@@ -302,15 +349,16 @@ export const InteractiveClockMatrix: React.FC = () => {
     }
   };
 
-  // Drawing handlers (supports full color painting with selectedColor)
-  const handlePixelClick = (row: number, col: number) => {
+  // Drawing helpers (supports multi-color paint, same-color toggle erase, and dedicated eraser)
+  const applyPixelChange = (row: number, col: number, action: 'paint' | 'erase') => {
+    const targetColor = action === 'erase' ? '#121721' : selectedColor;
+    const targetChar = action === 'erase' ? '.' : '#';
+
     setCanvasColorGrid(prev => {
       const newGrid = prev.map(r => [...r]);
-      const cur = newGrid[row][col];
-      // Toggle pixel color: if lit, turn off to #121721, else set to selectedColor
-      newGrid[row][col] = (cur && cur !== '#121721' && cur !== '#000000') ? '#121721' : selectedColor;
+      newGrid[row][col] = targetColor;
 
-      if (mode === 'anim' && animColorFrames[currentFrameIndex]) {
+      if ((mode === 'anim' || mode === 'draw') && animColorFrames[currentFrameIndex]) {
         setAnimColorFrames(frames => {
           const next = [...frames];
           next[currentFrameIndex] = newGrid;
@@ -323,10 +371,10 @@ export const InteractiveClockMatrix: React.FC = () => {
     setCanvasGrid(prev => {
       const newGrid = [...prev];
       const rowChars = newGrid[row].split('');
-      rowChars[col] = rowChars[col] === '#' ? '.' : '#';
+      rowChars[col] = targetChar;
       newGrid[row] = rowChars.join('');
 
-      if (mode === 'anim' && animFrames[currentFrameIndex]) {
+      if ((mode === 'anim' || mode === 'draw') && animFrames[currentFrameIndex]) {
         setAnimFrames(frames => {
           const nextFrames = [...frames];
           nextFrames[currentFrameIndex] = newGrid;
@@ -335,39 +383,32 @@ export const InteractiveClockMatrix: React.FC = () => {
       }
       return newGrid;
     });
+
+    setHasUnsyncedEdits(true);
+  };
+
+  const handlePixelMouseDown = (row: number, col: number) => {
+    if (mode !== 'draw' && mode !== 'anim') return;
+
+    // Pause animation while painting so the active frame doesn't jump mid-stroke
+    if (isPlayingAnimation) {
+      setIsPlayingAnimation(false);
+    }
+
+    const activeGrid = mode === 'anim' ? (animColorFrames[currentFrameIndex] || canvasColorGrid) : canvasColorGrid;
+    const cur = activeGrid[row]?.[col] || '#121721';
+    const isEraser = !selectedColor || selectedColor === '#121721' || selectedColor === '#000000';
+    const isSameColor = cur.toLowerCase() === selectedColor.toLowerCase();
+
+    const action: 'paint' | 'erase' = (isEraser || isSameColor) ? 'erase' : 'paint';
+    drawActionRef.current = action;
+    setIsDrawing(true);
+    applyPixelChange(row, col, action);
   };
 
   const handlePixelDraw = (row: number, col: number) => {
-    if (!isDrawing) return;
-    setCanvasColorGrid(prev => {
-      const newGrid = prev.map(r => [...r]);
-      newGrid[row][col] = selectedColor;
-
-      if (mode === 'anim' && animColorFrames[currentFrameIndex]) {
-        setAnimColorFrames(frames => {
-          const next = [...frames];
-          next[currentFrameIndex] = newGrid;
-          return next;
-        });
-      }
-      return newGrid;
-    });
-
-    setCanvasGrid(prev => {
-      const newGrid = [...prev];
-      const rowChars = newGrid[row].split('');
-      rowChars[col] = '#';
-      newGrid[row] = rowChars.join('');
-
-      if (mode === 'anim' && animFrames[currentFrameIndex]) {
-        setAnimFrames(frames => {
-          const nextFrames = [...frames];
-          nextFrames[currentFrameIndex] = newGrid;
-          return nextFrames;
-        });
-      }
-      return newGrid;
-    });
+    if (!isDrawing || (mode !== 'draw' && mode !== 'anim')) return;
+    applyPixelChange(row, col, drawActionRef.current);
   };
 
   const handleClearCanvas = () => {
@@ -375,7 +416,7 @@ export const InteractiveClockMatrix: React.FC = () => {
     const blankColor = Array(8).fill(null).map(() => Array(32).fill('#121721'));
     setCanvasGrid(blankMono);
     setCanvasColorGrid(blankColor);
-    if (mode === 'anim' && animColorFrames[currentFrameIndex]) {
+    if ((mode === 'anim' || mode === 'draw') && animColorFrames[currentFrameIndex]) {
       setAnimColorFrames(frames => {
         const nextFrames = [...frames];
         nextFrames[currentFrameIndex] = blankColor;
@@ -387,40 +428,110 @@ export const InteractiveClockMatrix: React.FC = () => {
         return nextFrames;
       });
     }
+    setHasUnsyncedEdits(true);
   };
 
   // Handler to load converted NCI animation from NciConverterPanel
-  const handleLoadNciToSimulator = (framesRgb: string[][][], fps: number, title: string) => {
+  const handleLoadNciToSimulator = (payload: NciSimulatorLoadPayload) => {
+    const { framesRgb, fps, frameMs, frameDelays, version, iconName, targetWidth, targetHeight, cropOffsetX } = payload;
+    const activeVer: NciFormatVersion = version || 'NCI2';
     setAnimColorFrames(framesRgb);
     setAnimFrames(framesRgb.map(f => f.map(row => row.map(c => (c && c !== '#121721' && c !== '#000000') ? '#' : '.').join(''))));
+    setAnimFrameDelays(frameDelays && frameDelays.length === framesRgb.length ? frameDelays : null);
     setAnimFps(fps);
-    setAnimTitle(title);
+    setAnimTitle(`NCI: ${iconName}`);
     setCurrentFrameIndex(0);
     setCanvasColorGrid(framesRgb[0]);
     setCanvasGrid(framesRgb[0].map(row => row.map(c => (c && c !== '#121721' && c !== '#000000') ? '#' : '.').join('')));
     setMode('anim');
-    setIsPlayingAnimation(true);
-    setGenerationFeedback(`已从 NCI 转换器成功载入「${title}」（${framesRgb.length} 帧，${fps} FPS）`);
+    // Pause automatically on single-frame icon so user can paint immediately; play multi-frame animation
+    setIsPlayingAnimation(framesRgb.length > 1);
+    setNciExportVersion(activeVer);
+    setNciSession({
+      iconName,
+      targetWidth,
+      targetHeight,
+      originalFrameMs: frameMs,
+      initialFps: fps,
+      cropOffsetX,
+      version: activeVer,
+    });
+    setNciExportSize(targetWidth === 8 ? '8x8' : '32x8');
+    setHasUnsyncedEdits(false);
+    setGenerationFeedback(
+      `已载入 ${activeVer} 图标「${iconName}」(${targetWidth}×8, ${framesRgb.length} 帧) — 可直接在上方点阵涂抹修改，完成后点击「写回 NCI 固件工作台」`
+    );
+    setTimeout(() => setGenerationFeedback(null), 6000);
+  };
+
+  // Build NciRawFrame[] matching current output dimensions (8x8 cropped center or full 32x8)
+  const buildNciExportData = () => {
+    const outWidth: 8 | 32 = nciExportSize === '8x8' ? 8 : 32;
+    const outHeight: 8 = 8;
+    const offsetX = nciExportSize === '8x8' ? 12 : 0;
+    const grids = exportMode === 'animation' ? animColorFrames : [canvasColorGrid];
+    const frameDelay = (nciSession && animFps === nciSession.initialFps)
+      ? Math.max(30, nciSession.originalFrameMs)
+      : Math.max(30, Math.round(1000 / animFps));
+
+    const rawFrames: NciRawFrame[] = grids.map((g, idx) => {
+      const pixels: [number, number, number, number][] = [];
+      for (let y = 0; y < outHeight; y++) {
+        for (let x = 0; x < outWidth; x++) {
+          pixels.push(hexToRgba(g[y]?.[offsetX + x] || ''));
+        }
+      }
+      const perFrameMs = exportMode === 'animation' && animFrameDelays?.[idx]
+        ? normalizeNci2FrameDelay(animFrameDelays[idx], frameDelay)
+        : frameDelay;
+      return { pixels, delay: perFrameMs };
+    });
+
+    const baseName = nciSession?.iconName || animTitle.replace(/^NCI:\s*/i, '');
+    const safeName = baseName.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5-]/g, '_') || 'pixel_animation';
+
+    return { rawFrames, outWidth, outHeight, frameDelay, safeName };
+  };
+
+  // Write edited frames back to NciConverterPanel for firmware rebuilding / device push
+  const handleWriteBackToNci = (scrollToPanel: boolean = false) => {
+    const { rawFrames, outWidth, outHeight, frameDelay, safeName } = buildNciExportData();
+    setNciWriteback({
+      id: Date.now(),
+      frames: rawFrames,
+      width: outWidth,
+      height: outHeight,
+      frameMs: frameDelay,
+      frameDelays: rawFrames.map(f => f.delay),
+      version: nciExportVersion,
+      iconName: safeName,
+    });
+    setHasUnsyncedEdits(false);
+    setWritebackSuccess(true);
+    setGenerationFeedback(
+      `已将修改后的 ${rawFrames.length} 帧 (${outWidth}×${outHeight} · ${nciExportVersion}) 写回下方 NCI 固件工作台！`
+    );
+    setTimeout(() => setWritebackSuccess(false), 2500);
     setTimeout(() => setGenerationFeedback(null), 5000);
+
+    if (scrollToPanel) {
+      const el = document.getElementById('nci-converter');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }
   };
 
   // Export to C++ array (Multi-Frame Animation or Single Frame, RGB565 or uint32)
   const exportCppArray = () => {
-    const frameDelay = Math.max(20, Math.round(1000 / animFps));
+    const frameDelay = (nciSession && animFps === nciSession.initialFps)
+      ? Math.max(30, nciSession.originalFrameMs)
+      : Math.max(30, Math.round(1000 / animFps));
 
     // 1. NCI RGB565 16-bit array export (Native Full-Color for ESP32 NeoClock)
     if (exportFormat === 'nci_rgb565') {
-      const grids = exportMode === 'animation' ? animColorFrames : [canvasColorGrid];
-      const rawFrames: NciRawFrame[] = grids.map(g => {
-        const pixels: [number, number, number, number][] = [];
-        for (let y = 0; y < 8; y++) {
-          for (let x = 0; x < 32; x++) {
-            pixels.push(hexToRgba(g[y]?.[x] || ''));
-          }
-        }
-        return { pixels, delay: frameDelay };
-      });
-      return generateCppRgb565Code(rawFrames, animTitle, 32, 8, frameDelay);
+      const { rawFrames, outWidth, outHeight, frameDelay: nciDelay, safeName } = buildNciExportData();
+      return generateCppRgb565Code(rawFrames, safeName, outWidth, outHeight, nciDelay, nciExportVersion);
     }
 
     // 2. Monochrome uint32 bitmask export
@@ -481,13 +592,14 @@ ${lines.join('\n')}
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
-  // Download .nci binary file directly (matching attachment makeNci specification)
+  // Download .nci binary file directly (respecting 8x8 or 32x8 target dimension and NCI1/NCI2 protocol)
   const handleDownloadNci = () => {
-    const grids = exportMode === 'animation' ? animColorFrames : [canvasColorGrid];
-    const frameDelay = Math.max(20, Math.round(1000 / animFps));
-    const blob = makeNciFromHexGrids(grids, 32, 8, frameDelay);
-    const safeName = animTitle.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5]/g, '_') || 'pixel_animation';
-    downloadNciBlob(blob, `${safeName}.nci`);
+    const { rawFrames, outWidth, outHeight, frameDelay, safeName } = buildNciExportData();
+    const res = buildNciByVersion(nciExportVersion, rawFrames, outWidth, outHeight, frameDelay, {
+      varTime: 'auto',
+      useZeroForDefault200: false,
+    });
+    downloadNciBlob(res.blob, `${safeName}.nci`);
     setDownloadSuccessNci(true);
     setTimeout(() => setDownloadSuccessNci(false), 2500);
   };
@@ -755,7 +867,9 @@ ${lines.join('\n')}
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-[11px] font-mono text-emerald-400">
-                  {mode === 'anim' ? `AI 动画: 帧 ${currentFrameIndex + 1}/${animFrames.length}` : '8×32 (256 Pixels)'}
+                  {mode === 'anim' 
+                    ? (nciSession ? `NCI: ${nciSession.iconName} · 帧 ${currentFrameIndex + 1}/${animFrames.length}` : `AI 动画: 帧 ${currentFrameIndex + 1}/${animFrames.length}`) 
+                    : '8×32 (256 Pixels)'}
                 </span>
                 <div className="flex items-center gap-1.5">
                   <div className="w-1.5 h-1.5 rounded-full bg-[#E60012] animate-pulse" />
@@ -773,7 +887,6 @@ ${lines.join('\n')}
                 filter: `brightness(${brightness}%)`,
               }}
               onMouseLeave={() => setIsDrawing(false)}
-              onMouseDown={() => setIsDrawing(true)}
               onMouseUp={() => setIsDrawing(false)}
             >
               {/* Diffuser lens blur overlay */}
@@ -793,12 +906,15 @@ ${lines.join('\n')}
                     {Array.from({ length: 32 }).map((_, c) => {
                       const cellColor = renderCellColor(r, c);
                       const isOff = cellColor === '#121721';
+                      const is8x8Zone = (mode === 'draw' || mode === 'anim') && nciExportSize === '8x8';
+                      const in8x8Box = c >= 12 && c <= 19;
                       
                       return (
                         <div
                           key={`${r}-${c}`}
-                          onClick={() => {
-                            if (mode === 'draw' || mode === 'anim') handlePixelClick(r, c);
+                          onMouseDown={e => {
+                            e.preventDefault();
+                            handlePixelMouseDown(r, c);
                           }}
                           onMouseEnter={() => {
                             if (mode === 'draw' || mode === 'anim') handlePixelDraw(r, c);
@@ -810,7 +926,11 @@ ${lines.join('\n')}
                               : 'none',
                           }}
                           className={`aspect-square rounded-[2px] transition-colors duration-75 relative ${
-                            isOff ? 'bg-[#121721] opacity-70' : 'opacity-100'
+                            isOff 
+                              ? (is8x8Zone && !in8x8Box ? 'bg-[#121721] opacity-35' : 'bg-[#121721] opacity-75') 
+                              : 'opacity-100'
+                          } ${
+                            is8x8Zone && in8x8Box ? 'ring-1 ring-amber-400/35' : ''
                           }`}
                         />
                       );
@@ -922,9 +1042,110 @@ ${lines.join('\n')}
             </button>
           </div>
 
-          {/* Quick Palette Bar on Simulator Chassis (Active in Draw or Anim mode) */}
+          {/* NCI Active Session & Quick Palette Bar on Simulator Chassis (Active in Draw or Anim mode) */}
           {(mode === 'draw' || mode === 'anim') && (
-            <div className="mt-4 max-w-4xl mx-auto">
+            <div className="mt-4 max-w-4xl mx-auto space-y-2.5">
+              {/* NCI Round-Trip Edit & Writeback Strip */}
+              <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-slate-900/95 border border-slate-800 text-xs shadow-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-white">
+                    <FileCode className="w-3.5 h-3.5 text-[#E60012]" />
+                    <span>
+                      {nciSession 
+                        ? `正在编辑 NCI 图标: ${nciSession.iconName}.nci` 
+                        : '点阵像素即时写回固件'}
+                    </span>
+                  </span>
+
+                  {/* 8x8 vs 32x8 Output Region Toggle */}
+                  <div className="flex items-center bg-slate-950 rounded-lg p-0.5 border border-slate-800 text-[10px] font-mono">
+                    <button
+                      onClick={() => setNciExportSize('8x8')}
+                      className={`px-2 py-0.5 rounded transition-all cursor-pointer ${
+                        nciExportSize === '8x8'
+                          ? 'bg-amber-500 text-black font-bold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="仅导出中心 8×8 区域（屏幕黄框第 13~20 列）为 8×8 NCI 图标"
+                    >
+                      8×8 图标 (中心区)
+                    </button>
+                    <button
+                      onClick={() => setNciExportSize('32x8')}
+                      className={`px-2 py-0.5 rounded transition-all cursor-pointer ${
+                        nciExportSize === '32x8'
+                          ? 'bg-[#E60012] text-white font-bold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="导出完整 32×8 横幅为 NCI 固件"
+                    >
+                      32×8 全景
+                    </button>
+                  </div>
+
+                  {/* NCI2 vs NCI1 Protocol Toggle */}
+                  <div className="flex items-center bg-slate-950 rounded-lg p-0.5 border border-slate-800 text-[10px] font-mono">
+                    <button
+                      onClick={() => setNciExportVersion('NCI2')}
+                      className={`px-2 py-0.5 rounded transition-all cursor-pointer ${
+                        nciExportVersion === 'NCI2'
+                          ? 'bg-emerald-600 text-white font-bold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="导出 NCI2 协议格式（支持 VARTIME 逐帧延时表）"
+                    >
+                      NCI2
+                    </button>
+                    <button
+                      onClick={() => setNciExportVersion('NCI1')}
+                      className={`px-2 py-0.5 rounded transition-all cursor-pointer ${
+                        nciExportVersion === 'NCI1'
+                          ? 'bg-slate-700 text-white font-bold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="导出传统 NCI1 兼容格式"
+                    >
+                      NCI1
+                    </button>
+                  </div>
+
+                  {hasUnsyncedEdits && (
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                      有未写回修改
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleWriteBackToNci(true)}
+                    className="px-3 py-1 rounded-lg bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 active:scale-95 text-slate-950 font-bold text-[11px] flex items-center gap-1 shadow-xs transition-all cursor-pointer"
+                    title="将当前上方点阵屏修改后的像素写回下方 NCI 固件工作台（可继续预览、下载或直接推送设备）"
+                  >
+                    {writebackSuccess ? (
+                      <>
+                        <Check className="w-3 h-3" />
+                        <span>已写回固件</span>
+                      </>
+                    ) : (
+                      <>
+                        <ArrowDownToLine className="w-3 h-3" />
+                        <span>写回 NCI 固件工作台</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    onClick={handleDownloadNci}
+                    className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-semibold text-[11px] flex items-center gap-1 shadow-xs transition-all cursor-pointer"
+                    title="直接将当前修改后的像素导出为 .nci 二进制固件文件"
+                  >
+                    {downloadSuccessNci ? <Check className="w-3 h-3" /> : <Download className="w-3 h-3" />}
+                    <span>{downloadSuccessNci ? '已导出 .nci' : '写出 .nci 固件'}</span>
+                  </button>
+                </div>
+              </div>
+
               <PixelPalettePicker
                 variant="compact"
                 selectedColor={selectedColor}
@@ -1142,10 +1363,15 @@ ${lines.join('\n')}
                     min="2"
                     max="12"
                     value={animFps}
-                    onChange={e => setAnimFps(Number(e.target.value))}
+                    onChange={e => {
+                      setAnimFps(Number(e.target.value));
+                      if (animFrameDelays) setAnimFrameDelays(null);
+                    }}
                     className="w-16 accent-[#E60012] cursor-pointer"
                   />
-                  <span className="w-10 text-slate-900 dark:text-white font-bold">{animFps} FPS</span>
+                  <span className="w-14 text-slate-900 dark:text-white font-bold">
+                    {animFrameDelays ? 'VARTIME' : `${animFps} FPS`}
+                  </span>
                 </div>
               </div>
             </div>
@@ -1290,6 +1516,32 @@ ${lines.join('\n')}
                     </button>
                   </div>
 
+                  {/* Output Resolution Selector: 8x8 vs 32x8 */}
+                  <div className="flex items-center bg-slate-100 dark:bg-slate-800 rounded p-0.5 text-[10px] font-mono">
+                    <button
+                      onClick={() => setNciExportSize('8x8')}
+                      className={`px-2 py-0.5 rounded transition-all ${
+                        nciExportSize === '8x8'
+                          ? 'bg-amber-500 text-slate-950 font-bold shadow-2xs'
+                          : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+                      }`}
+                      title="裁剪中心 8×8 区域导出"
+                    >
+                      8×8
+                    </button>
+                    <button
+                      onClick={() => setNciExportSize('32x8')}
+                      className={`px-2 py-0.5 rounded transition-all ${
+                        nciExportSize === '32x8'
+                          ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-2xs'
+                          : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+                      }`}
+                      title="完整 32×8 全景导出"
+                    >
+                      32×8
+                    </button>
+                  </div>
+
                   {/* Format Selector: NCI RGB565 vs uint32 */}
                   <div className="flex items-center bg-slate-100 dark:bg-slate-800 rounded p-0.5 text-[10px] font-mono">
                     <button
@@ -1317,12 +1569,31 @@ ${lines.join('\n')}
                   </div>
                 </div>
 
-                <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {/* Sync Back to NCI Converter */}
+                  <button
+                    onClick={() => handleWriteBackToNci(true)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-amber-500 hover:bg-amber-600 text-slate-950 rounded-md shadow-xs transition-all cursor-pointer"
+                    title="将当前修改后的像素同步写回下方 NCI 转换器，可用于重新预览或直接推送至 ESP32"
+                  >
+                    {writebackSuccess ? (
+                      <>
+                        <Check className="w-3 h-3" />
+                        <span>已写回</span>
+                      </>
+                    ) : (
+                      <>
+                        <ArrowDownToLine className="w-3 h-3" />
+                        <span>写回 NCI 工作台</span>
+                      </>
+                    )}
+                  </button>
+
                   {/* Download .NCI Binary Button */}
                   <button
                     onClick={handleDownloadNci}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-md shadow-xs transition-all"
-                    title="下载为标准 NCI1 二进制固件文件（直接可烧录/上传至 ESP32 设备）"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-md shadow-xs transition-all cursor-pointer"
+                    title={`下载为 ${nciExportVersion} 二进制固件文件（直接可烧录/上传至 ESP32 设备）`}
                   >
                     {downloadSuccessNci ? (
                       <>
@@ -1332,7 +1603,7 @@ ${lines.join('\n')}
                     ) : (
                       <>
                         <Download className="w-3 h-3" />
-                        <span>下载 .nci 固件</span>
+                        <span>下载 {nciExportVersion} (.nci)</span>
                       </>
                     )}
                   </button>
@@ -1340,7 +1611,7 @@ ${lines.join('\n')}
                   {/* Copy C++ Code */}
                   <button
                     onClick={handleCopyCode}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-200 dark:border-slate-700 rounded-md transition-colors"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-200 dark:border-slate-700 rounded-md transition-colors cursor-pointer"
                   >
                     {copiedCode ? (
                       <>
@@ -1364,13 +1635,13 @@ ${lines.join('\n')}
               <div className="mt-3 flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
                 <span>
                   {exportFormat === 'nci_rgb565' 
-                    ? '格式: 16-bit RGB565 逐像素高保真色彩 (0x0000 - 0xFFFF)' 
+                    ? `格式: 16-bit RGB565 (${nciExportSize === '8x8' ? '8×8 图标' : '32×8 全景'})` 
                     : '格式: uint32_t 行扫描位掩码'}
                 </span>
                 <span className="text-[#E60012] font-semibold">
                   {exportMode === 'animation' 
                     ? `${animColorFrames.length} 帧连续全彩 (${animFps} FPS)` 
-                    : '单帧静态 (32×8)'}
+                    : `单帧静态 (${nciExportSize})`}
                 </span>
               </div>
             </div>
@@ -1382,7 +1653,10 @@ ${lines.join('\n')}
         {/* NCI RGB565 Converter & ESP32 Device Syncer Tool                           */}
         {/* ========================================================================= */}
         <div className="max-w-4xl mx-auto mt-8">
-          <NciConverterPanel onLoadToSimulator={handleLoadNciToSimulator} />
+          <NciConverterPanel 
+            onLoadToSimulator={handleLoadNciToSimulator}
+            writebackPayload={nciWriteback}
+          />
         </div>
 
       </div>

@@ -1,15 +1,40 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   FileCode, Upload, Download, Copy, Check, Play, Pause,
-  Layers, Eye, Send, Terminal, Sparkles, RefreshCw, X, ArrowUpRight, Wifi
+  Layers, Eye, Send, Terminal, Sparkles, RefreshCw, X, ArrowUpRight, Wifi, Edit3, Hash
 } from 'lucide-react';
 import { 
-  makeNci, fileToNciFrames, downloadNciBlob, generateCppRgb565Code,
-  nciRawFrameToHexGrid, NciRawFrame 
+  buildNciByVersion, parseNci, fileToNciFrames, downloadNciBlob, generateCppRgb565Code,
+  nciRawFrameToHexGrid, normalizeNci2FrameDelay,
+  NciRawFrame, NciFormatVersion, NciVarTimeMode, NciBuildResult
 } from '../utils/nciFormat';
 
+export interface NciSimulatorLoadPayload {
+  framesRgb: string[][][]; // always 8 rows x 32 cols for upper simulator
+  fps: number;
+  frameMs: number;
+  frameDelays?: number[];
+  version?: NciFormatVersion;
+  iconName: string;
+  targetWidth: 8 | 32;
+  targetHeight: 8;
+  cropOffsetX: number;
+}
+
+export interface NciWritebackPayload {
+  id: number;
+  frames: NciRawFrame[];
+  width: 8 | 32;
+  height: 8;
+  frameMs: number;
+  frameDelays?: number[];
+  version?: NciFormatVersion;
+  iconName: string;
+}
+
 interface NciConverterPanelProps {
-  onLoadToSimulator?: (framesRgb: string[][][], fps: number, title: string) => void;
+  onLoadToSimulator?: (payload: NciSimulatorLoadPayload) => void;
+  writebackPayload?: NciWritebackPayload | null;
 }
 
 interface LogEntry {
@@ -18,9 +43,14 @@ interface LogEntry {
   time: string;
 }
 
-export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSimulator }) => {
+export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ 
+  onLoadToSimulator,
+  writebackPayload,
+}) => {
   const [file, setFile] = useState<File | null>(null);
   const [sizeKey, setSizeKey] = useState<'8x8' | '32x8'>('8x8');
+  const [nciVersion, setNciVersion] = useState<NciFormatVersion>('NCI2');
+  const [varTimeMode, setVarTimeMode] = useState<NciVarTimeMode>('auto');
   const [frameMsOverride, setFrameMsOverride] = useState<number>(0);
   const [maxFrames, setMaxFrames] = useState<number>(60);
   const [iconName, setIconName] = useState<string>('time');
@@ -29,6 +59,8 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
   // Conversion results
   const [frames, setFrames] = useState<NciRawFrame[]>([]);
   const [nciBlob, setNciBlob] = useState<Blob | null>(null);
+  const [buildMeta, setBuildMeta] = useState<NciBuildResult | null>(null);
+  const [activeDims, setActiveDims] = useState<{ w: number; h: number }>({ w: 8, h: 8 });
   const [metaInfo, setMetaInfo] = useState<string>('未载入文件');
   const [activeFrameIndex, setActiveFrameIndex] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
@@ -37,14 +69,20 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isTestingDevice, setIsTestingDevice] = useState<boolean>(false);
   const [deviceTestResult, setDeviceTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [lametricInput, setLametricInput] = useState<string>('230');
+  const [isFetchingLametric, setIsFetchingLametric] = useState<boolean>(false);
+  const [syncBadge, setSyncBadge] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([
-    { text: '转换引擎已就绪：支持解析标准 PNG 及多帧 GIF 动图', type: 'info', time: 'SYS' }
+    { text: '转换引擎已就绪：支持 PNG / GIF / .NCI (NCI1/NCI2) 与 LaMetric 图标 ID（如 230）在线拉取，默认输出 NCI2 格式', type: 'info', time: 'SYS' }
   ]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const lastWritebackIdRef = useRef<number>(0);
 
   // Target resolution
   const [targetWidth, targetHeight] = sizeKey === '8x8' ? [8, 8] : [32, 8];
+  const previewWidth = frames.length > 0 ? activeDims.w : targetWidth;
+  const previewHeight = frames.length > 0 ? activeDims.h : targetHeight;
 
   const addLog = (text: string, type: 'info' | 'ok' | 'err' = 'info') => {
     const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -69,44 +107,215 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
     return () => clearTimeout(timer);
   }, [isPlaying, frames, activeFrameIndex]);
 
-  // Handle conversion matching exact functional logic from index_3f785a56.html
-  const handleConvert = async (inputFile?: File) => {
+  // Format summary metadata string for banner & logs
+  const formatMetaSummary = (res: NciBuildResult, baseName: string, extraTag?: string): string => {
+    const minDelay = Math.min(...res.frameDelays);
+    const maxDelay = Math.max(...res.frameDelays);
+    const delayDesc = res.hasVarTime
+      ? (minDelay === maxDelay ? `逐帧表 ${minDelay}ms` : `逐帧表 ${minDelay}~${maxDelay}ms`)
+      : `${res.headerFrameMs === 0 ? '默认 200' : res.headerFrameMs}ms`;
+    const flagDesc = res.version === 'NCI2'
+      ? `NCI2 (0x${res.flags.toString(16).padStart(2, '0')}${res.hasVarTime ? ' VARTIME' : ''})`
+      : 'NCI1';
+    const byteDesc = res.version === 'NCI2'
+      ? `${res.totalBytes} B (12+${res.delayTableBytes}+${res.pixelBytes})`
+      : `${res.totalBytes} 字节`;
+    return [
+      `${res.width}×${res.height}`,
+      `${res.frameCount} 帧`,
+      delayDesc,
+      extraTag,
+      `${flagDesc} · ${byteDesc} (${baseName}.nci)`,
+    ].filter(Boolean).join(' · ');
+  };
+
+  // Repack existing frames whenever format version or VARTIME mode changes
+  const repackFrames = (
+    sourceFrames: NciRawFrame[],
+    w: number,
+    h: number,
+    overrideMs: number,
+    version: NciFormatVersion,
+    vtMode: NciVarTimeMode,
+    baseName: string,
+    extraTag?: string
+  ): NciBuildResult => {
+    const firstDelay = sourceFrames[0]?.delay || 200;
+    const baseFrameMs = overrideMs > 0
+      ? Math.max(30, overrideMs)
+      : (version === 'NCI2' && sourceFrames.length === 1 && firstDelay === 200 ? 0 : firstDelay);
+
+    const res = buildNciByVersion(version, sourceFrames, w, h, baseFrameMs, {
+      varTime: vtMode,
+      useZeroForDefault200: overrideMs === 0,
+    });
+    setNciBlob(res.blob);
+    setBuildMeta(res);
+    setActiveDims({ w, h });
+    setMetaInfo(formatMetaSummary(res, baseName, extraTag));
+    return res;
+  };
+
+  const handleVersionChange = (nextVersion: NciFormatVersion) => {
+    setNciVersion(nextVersion);
+    if (frames.length > 0) {
+      const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+      const res = repackFrames(frames, activeDims.w, activeDims.h, frameMsOverride, nextVersion, varTimeMode, base);
+      addLog(
+        `已切换封装协议为 ${res.version} (flags=0x${res.flags.toString(16).padStart(2, '0')}${res.hasVarTime ? ' VARTIME' : ''})，固件大小 ${res.totalBytes} 字节 (12+${res.delayTableBytes}+${res.pixelBytes})`,
+        'ok'
+      );
+    }
+  };
+
+  const handleVarTimeChange = (nextVt: NciVarTimeMode) => {
+    setVarTimeMode(nextVt);
+    if (frames.length > 0 && nciVersion === 'NCI2') {
+      const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+      const res = repackFrames(frames, activeDims.w, activeDims.h, frameMsOverride, 'NCI2', nextVt, base);
+      addLog(
+        `已更新 NCI2 延时表模式 (${nextVt})：flags=0x${res.flags.toString(16).padStart(2, '0')}${res.hasVarTime ? ' VARTIME' : ''}，总长 ${res.totalBytes} 字节 (12+${res.delayTableBytes}+${res.pixelBytes})`,
+        'ok'
+      );
+    }
+  };
+
+  // Receive writeback edits from the upper 8x32 Clock Simulator and rebuild .nci firmware
+  useEffect(() => {
+    if (!writebackPayload || writebackPayload.id === lastWritebackIdRef.current) return;
+    lastWritebackIdRef.current = writebackPayload.id;
+
+    const { frames: editedFrames, width: w, height: h, frameMs, version: wbVersion, iconName: editedName } = writebackPayload;
+    if (!editedFrames || editedFrames.length === 0) return;
+
+    const nextSizeKey: '8x8' | '32x8' = w === 8 ? '8x8' : '32x8';
+    setSizeKey(nextSizeKey);
+
+    const targetVer = wbVersion || nciVersion;
+    if (wbVersion) setNciVersion(wbVersion);
+
+    const safeBase = editedName.replace(/^NCI:\s*/i, '').replace(/[^A-Za-z0-9_-]/g, '') || iconName || 'icon';
+    setIconName(safeBase);
+
+    const delaysDiffer = editedFrames.length > 1 && new Set(editedFrames.map(f => normalizeNci2FrameDelay(f.delay, frameMs))).size > 1;
+    setFrameMsOverride(delaysDiffer ? 0 : frameMs);
+
+    const res = repackFrames(editedFrames, w, h, delaysDiffer ? 0 : frameMs, targetVer, varTimeMode, safeBase, '已同步时钟修改');
+    setFrames(editedFrames);
+    setActiveFrameIndex(0);
+    setIsPlaying(editedFrames.length > 1);
+
+    setSyncBadge(`已写回上方时钟修改 (${editedFrames.length} 帧 ${w}×${h} · ${res.version})`);
+    setTimeout(() => setSyncBadge(null), 6000);
+
+    addLog(
+      `✅ 已从上方时钟写回 ${editedFrames.length} 帧 (${w}×${h})，封包 ${res.version} (flags=0x${res.flags.toString(16).padStart(2, '0')}${res.hasVarTime ? ' VARTIME' : ''})，总长 ${res.totalBytes} 字节 (${safeBase}.nci)`,
+      'ok'
+    );
+  }, [writebackPayload]);
+
+  // Handle conversion matching exact functional logic (supports NCI1 & NCI2 + PNG/JPG/GIF)
+  const handleConvert = async (inputFile?: File, overrideWidth?: number, overrideHeight?: number, overrideIconName?: string) => {
     const f = inputFile || file;
     if (!f) {
-      addLog('请先选择或拖入 PNG / GIF 图片文件', 'err');
+      addLog('请先选择或拖入 PNG / GIF / NCI 文件，或输入 LaMetric 图标 ID 拉取', 'err');
       return;
     }
 
+    const effectiveW = overrideWidth ?? targetWidth;
+    const effectiveH = overrideHeight ?? targetHeight;
+
     setIsProcessing(true);
     try {
+      const isNciFile = f.name.toLowerCase().endsWith('.nci');
+
+      if (isNciFile) {
+        addLog(`正在解析已有 NCI 二进制固件: ${f.name} ...`, 'info');
+        const buf = await f.arrayBuffer();
+        const parsed = parseNci(buf);
+        if (parsed.width === 8) setSizeKey('8x8');
+        else if (parsed.width === 32) setSizeKey('32x8');
+
+        setNciVersion(parsed.version);
+        if (parsed.version === 'NCI2') {
+          if (parsed.hasVarTime && new Set(parsed.frameDelays).size <= 1) {
+            setVarTimeMode('always');
+          } else if (!parsed.hasVarTime && parsed.frameCount > 1) {
+            setVarTimeMode('off');
+          }
+        }
+
+        const safeOverride = frameMsOverride > 0 ? Math.max(30, frameMsOverride) : 0;
+        const finalFrames = safeOverride > 0
+          ? parsed.frames.map(fr => ({ ...fr, delay: safeOverride }))
+          : parsed.frames;
+
+        const effectiveVt: NciVarTimeMode = parsed.version === 'NCI2'
+          ? (parsed.hasVarTime && new Set(parsed.frameDelays).size <= 1 ? 'always' : (parsed.hasVarTime ? 'auto' : varTimeMode))
+          : varTimeMode;
+
+        const base = (overrideIconName || iconName).replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+        const res = buildNciByVersion(
+          parsed.version,
+          finalFrames,
+          parsed.width,
+          parsed.height,
+          safeOverride > 0 ? safeOverride : (parsed.rawFrameMs ?? parsed.frameMs),
+          { varTime: effectiveVt, useZeroForDefault200: safeOverride === 0 && parsed.rawFrameMs === 0 }
+        );
+
+        setFrames(finalFrames);
+        setNciBlob(res.blob);
+        setBuildMeta(res);
+        setActiveDims({ w: parsed.width, h: parsed.height });
+        setActiveFrameIndex(0);
+        setIsPlaying(finalFrames.length > 1);
+        setSyncBadge(null);
+
+        setMetaInfo(formatMetaSummary(res, base));
+        addLog(
+          `解析 ${parsed.version} 成功！${finalFrames.length} 帧 (${parsed.width}×${parsed.height}), flags=0x${parsed.flags.toString(16).padStart(2, '0')}${parsed.hasVarTime ? ' VARTIME' : ''}, 长度 ${buf.byteLength} B`,
+          'ok'
+        );
+        return;
+      }
+
       const isGif = f.type === 'image/gif' || f.name.toLowerCase().endsWith('.gif');
       addLog(isGif ? `开始二进制 LZW 解码动图: ${f.name} ...` : `解析静态像素图像: ${f.name} ...`, 'info');
 
+      const clampedOverride = frameMsOverride > 0 ? Math.max(30, frameMsOverride) : 0;
+      if (frameMsOverride > 0 && frameMsOverride < 30 && nciVersion === 'NCI2') {
+        addLog(`注意：NCI2 协议要求非 0 帧间隔 >= 30ms，已自动修正 ${frameMsOverride}ms -> 30ms`, 'info');
+      }
+
       const parsedFrames = await fileToNciFrames(
         f,
-        targetWidth,
-        targetHeight,
+        effectiveW,
+        effectiveH,
         maxFrames,
-        frameMsOverride
+        clampedOverride
       );
 
       if (!parsedFrames || parsedFrames.length === 0) {
         throw new Error('未能从图片中解析出有效像素帧');
       }
 
-      const finalFrameMs = frameMsOverride || parsedFrames[0].delay || 200;
-      const blob = makeNci(parsedFrames, targetWidth, targetHeight, finalFrameMs);
+      if (!isGif && clampedOverride > 0) {
+        parsedFrames.forEach(fr => { fr.delay = clampedOverride; });
+      }
+
+      const base = (overrideIconName || iconName).replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+      const res = repackFrames(parsedFrames, effectiveW, effectiveH, clampedOverride, nciVersion, varTimeMode, base);
 
       setFrames(parsedFrames);
-      setNciBlob(blob);
       setActiveFrameIndex(0);
-      setIsPlaying(true);
+      setIsPlaying(parsedFrames.length > 1);
+      setSyncBadge(null);
 
-      const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
-      const infoStr = `${targetWidth}×${targetHeight} · ${parsedFrames.length} 帧 · 帧间隔 ${finalFrameMs}ms · NCI1 固件 ${blob.size} 字节 (${base}.nci)`;
-      setMetaInfo(infoStr);
-
-      addLog(`转换成功！已生成 ${parsedFrames.length} 帧 16-bit RGB565 数据，体积 ${blob.size} 字节`, 'ok');
+      addLog(
+        `转换成功！${res.version} 格式 · ${res.frameCount} 帧 (${effectiveW}×${effectiveH}) · flags=0x${res.flags.toString(16).padStart(2, '0')}${res.hasVarTime ? ' VARTIME逐帧表' : ''} · 总长 ${res.totalBytes} B (12头+${res.delayTableBytes}延时+${res.pixelBytes}像素)`,
+        'ok'
+      );
     } catch (err: any) {
       console.error('NCI conversion failed:', err);
       addLog(`转换失败: ${err.message || String(err)}`, 'err');
@@ -116,48 +325,156 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
     }
   };
 
+  // Extract numeric LaMetric icon ID from raw ID ("230", "a230", "#230") or full URL
+  const extractLametricId = (raw: string): string => {
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    // Full URL e.g. https://developer.lametric.com/content/apps/icon_thumbs/230
+    const urlMatch = trimmed.match(/icon_thumbs\/(\d+)/i);
+    if (urlMatch) return urlMatch[1];
+    // Prefixed or pure numeric ID (230, a230, i230, #230)
+    const idMatch = trimmed.match(/^[#aiAI]?(\d{1,10})$/);
+    if (idMatch) return idMatch[1];
+    // Fallback: grab last numeric segment
+    const anyNum = trimmed.match(/(\d{1,10})/);
+    return anyNum ? anyNum[1] : '';
+  };
+
+  // Load LaMetric icon by ID (fetches via backend proxy first, then direct CORS URL fallback)
+  const handleLoadLametricIcon = async (customInput?: string) => {
+    const rawVal = customInput !== undefined ? customInput : lametricInput;
+    const cleanId = extractLametricId(rawVal);
+
+    if (!cleanId) {
+      addLog('请输入有效的 LaMetric 图标 ID（例如 230）或完整链接 https://developer.lametric.com/content/apps/icon_thumbs/230', 'err');
+      return;
+    }
+
+    setLametricInput(cleanId);
+    setIsFetchingLametric(true);
+    addLog(`正在从 LaMetric 图标库拉取图标 #${cleanId} ...`, 'info');
+
+    try {
+      let blob: Blob | null = null;
+      let contentType = '';
+
+      // 1. Try local backend proxy (/api/lametric-icon/:id)
+      try {
+        const proxyRes = await fetch(`/api/lametric-icon/${cleanId}`);
+        if (proxyRes.ok) {
+          contentType = proxyRes.headers.get('content-type') || '';
+          blob = await proxyRes.blob();
+        } else if (proxyRes.status === 404) {
+          throw new Error(`LaMetric 官方库中不存在 ID 为 #${cleanId} 的图标`);
+        }
+      } catch (proxyErr: any) {
+        if (proxyErr.message?.includes('不存在')) throw proxyErr;
+      }
+
+      // 2. Direct browser fetch fallback (developer.lametric.com sets Access-Control-Allow-Origin: *)
+      if (!blob) {
+        const directUrl = `https://developer.lametric.com/content/apps/icon_thumbs/${cleanId}`;
+        const directRes = await fetch(directUrl);
+        if (!directRes.ok) {
+          throw new Error(directRes.status === 404 ? `未找到 LaMetric 图标 #${cleanId}` : `拉取失败 (HTTP ${directRes.status})`);
+        }
+        contentType = directRes.headers.get('content-type') || '';
+        blob = await directRes.blob();
+      }
+
+      // Detect magic bytes to ensure exact file extension & MIME type (GIF vs PNG)
+      const headBytes = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
+      const isGifMagic = headBytes[0] === 0x47 && headBytes[1] === 0x49 && headBytes[2] === 0x46; // "GIF"
+      const isPngMagic = headBytes[0] === 0x89 && headBytes[1] === 0x50 && headBytes[2] === 0x4E && headBytes[3] === 0x47; // "\x89PNG"
+
+      const isGif = isGifMagic || contentType.includes('gif');
+      const ext = isGif ? '.gif' : (isPngMagic || contentType.includes('png') ? '.png' : '.png');
+      const mime = isGif ? 'image/gif' : 'image/png';
+
+      const fetchedName = `lametric_${cleanId}${ext}`;
+      const fetchedFile = new File([blob], fetchedName, { type: mime });
+      const newIconName = `lm_${cleanId}`;
+
+      // LaMetric icons are native 8x8 sprites -> automatically switch target to 8x8
+      setSizeKey('8x8');
+      setFile(fetchedFile);
+      setIconName(newIconName);
+
+      addLog(`✅ 成功获取 LaMetric 图标 #${cleanId} (${isGif ? 'GIF 动图' : 'PNG 静态图'}, ${blob.size} 字节)，正在转换为 8×8 RGB565...`, 'ok');
+
+      await handleConvert(fetchedFile, 8, 8, newIconName);
+    } catch (err: any) {
+      console.error('Failed to fetch LaMetric icon:', err);
+      addLog(`❌ 加载 LaMetric 图标失败: ${err.message || String(err)}`, 'err');
+    } finally {
+      setIsFetchingLametric(false);
+    }
+  };
+
   // Download .nci binary
   const handleDownloadNci = () => {
     if (!nciBlob) return;
     const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
     downloadNciBlob(nciBlob, `${base}.nci`);
-    addLog(`已保存 NCI1 二进制固件至本地: ${base}.nci`, 'ok');
+    addLog(`已保存 ${buildMeta?.version || nciVersion} 二进制固件至本地: ${base}.nci (${nciBlob.size} 字节)`, 'ok');
   };
 
   // Load to 8x32 simulator above
   const handleLoadToSimulator = () => {
     if (!onLoadToSimulator || frames.length === 0) return;
-    const finalFrameMs = frameMsOverride || frames[0].delay || 200;
-    const fps = Math.round(1000 / Math.max(30, finalFrameMs));
+    const finalFrameMs = frameMsOverride > 0 ? Math.max(30, frameMsOverride) : (frames[0].delay || 200);
+    const fps = Math.max(2, Math.min(12, Math.round(1000 / Math.max(30, finalFrameMs))));
+    const w = previewWidth;
+    const h = previewHeight;
 
     // Convert to hex matrix (8 rows × 32 cols)
     const hexGrids: string[][][] = frames.map(fr => {
-      const rawGrid = nciRawFrameToHexGrid(fr, targetWidth, targetHeight);
-      if (targetWidth === 8) {
-        // Horizontally center 8x8 icon on 8x32 display (12 cols empty, 8 cols icon, 12 cols empty)
-        return rawGrid.map(row => [
-          ...Array(12).fill('#121721'),
-          ...row,
-          ...Array(12).fill('#121721')
-        ]);
+      const rawGrid = nciRawFrameToHexGrid(fr, w, h);
+      // Pad vertically if h < 8 and horizontally into 32 cols
+      const padLeft = w <= 8 ? 12 : Math.max(0, Math.floor((32 - w) / 2));
+      const fullRows: string[][] = [];
+      for (let r = 0; r < 8; r++) {
+        const srcRow = rawGrid[r] || [];
+        const row32 = Array(32).fill('#121721');
+        for (let c = 0; c < w && padLeft + c < 32; c++) {
+          if (srcRow[c]) row32[padLeft + c] = srcRow[c];
+        }
+        fullRows.push(row32);
       }
-      return rawGrid;
+      return fullRows;
     });
 
-    const base = iconName.trim() || 'icon';
-    onLoadToSimulator(hexGrids, fps, `NCI: ${base}`);
-    addLog(`已成功载入上方 8×32 硬件仿真器进行全彩连续播放（${frames.length} 帧，${fps} FPS）`, 'ok');
+    const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
+    const frameDelays = frames.map(fr => normalizeNci2FrameDelay(fr.delay, finalFrameMs));
+    onLoadToSimulator({
+      framesRgb: hexGrids,
+      fps,
+      frameMs: finalFrameMs,
+      frameDelays,
+      version: nciVersion,
+      iconName: base,
+      targetWidth: w <= 8 ? 8 : 32,
+      targetHeight: 8,
+      cropOffsetX: w <= 8 ? 12 : 0,
+    });
+    addLog(`已载入上方 8×32 时钟（${w}×${h}, ${frames.length} 帧, ${nciVersion}）。请在上方点阵屏修改后点击「写回 NCI 固件」！`, 'ok');
+
+    // Scroll smoothly to upper simulator
+    const el = document.getElementById('simulator');
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
   };
 
   // Copy C++ uint16_t RGB565 Array code
   const handleCopyCppCode = () => {
     if (frames.length === 0) return;
-    const finalFrameMs = frameMsOverride || frames[0].delay || 200;
+    const finalFrameMs = frameMsOverride > 0 ? Math.max(30, frameMsOverride) : (frames[0].delay || 200);
     const base = iconName.replace(/[^A-Za-z0-9_-]/g, '') || 'icon';
-    const code = generateCppRgb565Code(frames, base, targetWidth, targetHeight, finalFrameMs);
+    const code = generateCppRgb565Code(frames, base, previewWidth, previewHeight, finalFrameMs, nciVersion);
     navigator.clipboard.writeText(code);
     setCopiedCode(true);
-    addLog('C++ uint16_t RGB565 数组已复制到剪贴板，可直接粘贴进 Arduino / ESP-IDF 项目', 'ok');
+    addLog(`C++ uint16_t RGB565 数组 (${nciVersion}) 已复制到剪贴板，可直接粘贴进 Arduino / ESP-IDF 项目`, 'ok');
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
@@ -304,37 +621,72 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
                 NCI RGB565 固件转换工作台
               </h3>
               <span className="text-[10px] font-mono font-medium text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
-                NeoClock / Awtrix 原生格式
+                支持 NCI2 / NCI1 · RGB565
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              单文件独立工具：支持将本地 PNG / GIF 转化为 16-bit RGB565 NCI1 二进制固件，提供实时像素预览与一键导入时钟。
+              单文件独立工具：支持将本地 PNG / GIF / LaMetric 图标转化为 16-bit RGB565 NCI2（含 VARTIME 逐帧延时表）或 NCI1 二进制固件。
             </p>
           </div>
         </div>
 
-        {/* Target Size Toggle Pill */}
-        <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-mono">
-          <button
-            onClick={() => setSizeKey('8x8')}
-            className={`px-3 py-1 rounded-lg font-medium transition-all ${
-              sizeKey === '8x8'
-                ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-xs'
-                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            8×8 图标
-          </button>
-          <button
-            onClick={() => setSizeKey('32x8')}
-            className={`px-3 py-1 rounded-lg font-medium transition-all ${
-              sizeKey === '32x8'
-                ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-xs'
-                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-            }`}
-          >
-            32×8 横幅全景
-          </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Protocol Version Toggle: NCI2 vs NCI1 */}
+          <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-mono">
+            <button
+              type="button"
+              onClick={() => handleVersionChange('NCI2')}
+              className={`px-2.5 py-1 rounded-lg font-medium transition-all flex items-center gap-1 cursor-pointer ${
+                nciVersion === 'NCI2'
+                  ? 'bg-emerald-600 text-white font-bold shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+              title="NCI2 新版协议：支持 0x01 RGB565 与 0x02 VARTIME 逐帧延时表"
+            >
+              <span>NCI2</span>
+              <span className={`text-[9px] px-1 rounded ${nciVersion === 'NCI2' ? 'bg-white/20 text-white' : 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'}`}>
+                推荐
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleVersionChange('NCI1')}
+              className={`px-2.5 py-1 rounded-lg font-medium transition-all cursor-pointer ${
+                nciVersion === 'NCI1'
+                  ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+              title="NCI1 传统固定帧速协议（向后兼容旧版固件）"
+            >
+              NCI1
+            </button>
+          </div>
+
+          {/* Target Size Toggle Pill */}
+          <div className="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-mono">
+            <button
+              type="button"
+              onClick={() => setSizeKey('8x8')}
+              className={`px-3 py-1 rounded-lg font-medium transition-all cursor-pointer ${
+                sizeKey === '8x8'
+                  ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              8×8 图标
+            </button>
+            <button
+              type="button"
+              onClick={() => setSizeKey('32x8')}
+              className={`px-3 py-1 rounded-lg font-medium transition-all cursor-pointer ${
+                sizeKey === '32x8'
+                  ? 'bg-white dark:bg-slate-900 text-[#E60012] font-bold shadow-xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              32×8 横幅全景
+            </button>
+          </div>
         </div>
       </div>
 
@@ -372,7 +724,7 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/png,image/gif,image/jpeg,image/webp"
+              accept="image/png,image/gif,image/jpeg,image/webp,.nci"
               onChange={e => {
                 const f = e.target.files?.[0];
                 if (f) {
@@ -391,10 +743,10 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
               </div>
               <div>
                 <p className="text-xs font-bold text-slate-800 dark:text-slate-200">
-                  {file ? file.name : '点击选择或拖入 PNG / GIF 动图'}
+                  {file ? file.name : '点击选择或拖入 PNG / GIF / .NCI 固件'}
                 </p>
                 <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                  {file ? `${(file.size / 1024).toFixed(1)} KB · 点击可重新更换文件` : '支持透明通道 PNG 与多帧序列 GIF，自动最近邻像素化'}
+                  {file ? `${(file.size / 1024).toFixed(1)} KB · 点击可重新更换文件` : '支持透明 PNG、多帧 GIF 以及直接读取现有 .nci 文件回炉修改'}
                 </p>
               </div>
             </div>
@@ -409,6 +761,78 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
             >
               浏览文件
             </button>
+          </div>
+
+          {/* LaMetric Icon ID Online Loader */}
+          <div className="p-3.5 rounded-xl bg-slate-50/80 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700/80 space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                <Hash className="w-3.5 h-3.5 text-[#E60012]" />
+                <span>从 LaMetric 图标库通过 ID 加载 (8×8 原生图标)</span>
+              </label>
+              <a
+                href="https://developer.lametric.com/icons"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-0.5 font-mono"
+              >
+                <span>浏览 LaMetric 图标库</span>
+                <ArrowUpRight className="w-3 h-3" />
+              </a>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={lametricInput}
+                onChange={e => setLametricInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleLoadLametricIcon();
+                  }
+                }}
+                placeholder="输入 ID（如 230、2867）或粘贴 icon_thumbs 链接"
+                className="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
+              />
+              <button
+                type="button"
+                onClick={() => handleLoadLametricIcon()}
+                disabled={isFetchingLametric || isProcessing || !lametricInput.trim()}
+                className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 dark:bg-[#E60012] dark:hover:bg-[#CC0010] active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition-all whitespace-nowrap cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isFetchingLametric ? 'animate-spin' : ''}`} />
+                <span>{isFetchingLametric ? '拉取中...' : '加载图标 ID'}</span>
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <span className="text-slate-500 dark:text-slate-400 text-[10px]">热门测试 ID:</span>
+              {[
+                { id: '230', label: '#230' },
+                { id: '87', label: '#87 笑脸' },
+                { id: '2867', label: '#2867 动图' },
+                { id: '795', label: '#795 火焰' },
+                { id: '1246', label: '#1246 信号' },
+                { id: '13524', label: '#13524 霓虹' },
+                { id: '635', label: '#635 PNG' },
+                { id: '90', label: '#90 太阳' },
+              ].map(item => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => handleLoadLametricIcon(item.id)}
+                  disabled={isFetchingLametric}
+                  className={`px-2 py-0.5 rounded-md font-mono text-[10px] border transition-colors cursor-pointer ${
+                    extractLametricId(lametricInput) === item.id && iconName === `lm_${item.id}`
+                      ? 'bg-[#E60012]/10 border-[#E60012]/40 text-[#E60012] font-bold'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-[#E60012]/40 hover:text-[#E60012]'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* Form Settings Controls */}
@@ -451,7 +875,7 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
             {/* Frame Delay Override */}
             <div>
               <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
-                帧间隔覆盖 (毫秒，0 = 原始)
+                帧间隔覆盖 (0 = 原始/默认200ms，否则 ≥30ms)
               </label>
               <input
                 type="number"
@@ -460,10 +884,10 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
                 value={frameMsOverride}
                 onChange={e => setFrameMsOverride(Math.max(0, Number(e.target.value) || 0))}
                 className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
-                placeholder="0 为使用 GIF 原始延迟"
+                placeholder="0 为使用 GIF 原始延迟 / 默认 200ms"
               />
               <span className="text-[10px] text-slate-400 mt-1 block">
-                设置大于 0 则覆盖 GIF 内部帧速（如 120ms ≈ 8 FPS）
+                NCI2 规范：0 表示默认 200ms（或保留 GIF 原延时）；否则必须 ≥ 30ms
               </span>
             </div>
 
@@ -480,6 +904,42 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
                 onChange={e => setMaxFrames(Math.max(1, Math.min(60, Number(e.target.value) || 60)))}
                 className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl px-3 py-2 text-slate-900 dark:text-white text-xs font-mono focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
               />
+            </div>
+
+            {/* NCI2 VARTIME Per-frame Delay Table Selector */}
+            <div>
+              <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                NCI2 逐帧延时表 (flags bit1: 0x02 VARTIME)
+              </label>
+              <div className={`grid grid-cols-3 gap-1 p-1 rounded-xl border text-[11px] font-mono ${
+                nciVersion === 'NCI2'
+                  ? 'bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+                  : 'bg-slate-100/50 dark:bg-slate-800/40 border-slate-200/60 dark:border-slate-800 opacity-50 pointer-events-none'
+              }`}>
+                {[
+                  { key: 'auto' as const, label: '自动识别' },
+                  { key: 'always' as const, label: '强制开启' },
+                  { key: 'off' as const, label: '关闭(固定)' },
+                ].map(opt => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => handleVarTimeChange(opt.key)}
+                    className={`py-1.5 px-1.5 rounded-lg font-medium transition-all cursor-pointer ${
+                      varTimeMode === opt.key
+                        ? 'bg-white dark:bg-slate-900 text-emerald-600 dark:text-emerald-400 font-bold shadow-2xs'
+                        : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <span className="text-[10px] text-slate-400 mt-1 block">
+                {nciVersion === 'NCI2'
+                  ? '自动模式：GIF 帧间隔不同时自动写入逐帧 u16 延时表 (0x03)'
+                  : '当前为 NCI1 兼容模式，切换至 NCI2 可启用逐帧延时表'}
+              </span>
             </div>
 
             {/* Optional Device IP */}
@@ -530,126 +990,145 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({ onLoadToSi
 
           </div>
 
-          {/* Action Buttons Toolbar */}
-          <div className="pt-2 flex flex-wrap items-center gap-2">
+        </div>
+
+        {/* Right Column: Hardware Pixel Simulation Preview + Action Buttons Toolbar (5 cols) */}
+        <div className="lg:col-span-5 flex flex-col gap-4">
+          <div className="bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 flex flex-col justify-between space-y-4">
+            
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                <Eye className="w-3.5 h-3.5 text-[#E60012]" />
+                <span>点阵屏仿真预览 ({previewWidth}×{previewHeight})</span>
+              </span>
+
+              {frames.length > 1 && (
+                <div className="flex items-center gap-2 font-mono text-[11px] text-slate-500">
+                  <button
+                    onClick={() => setIsPlaying(!isPlaying)}
+                    className="px-2 py-0.5 rounded bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:text-slate-900 dark:hover:text-white flex items-center gap-1"
+                  >
+                    {isPlaying ? <Pause className="w-2.5 h-2.5 text-amber-500" /> : <Play className="w-2.5 h-2.5 text-emerald-500" />}
+                    <span>{isPlaying ? '暂停' : '播放'}</span>
+                  </button>
+                  <span>{activeFrameIndex + 1} / {frames.length} 帧 ({Math.max(30, currentFrame?.delay || 200)}ms)</span>
+                </div>
+              )}
+            </div>
+
+            {/* Pixel LED Matrix Chassis matching top display */}
+            <div className="w-full flex items-center justify-center py-2">
+              <div className="p-3 rounded-xl bg-[#0F141E] border border-slate-800 shadow-inner w-full flex items-center justify-center">
+                <div 
+                  className="grid gap-[2px] sm:gap-[3px] select-none"
+                  style={{
+                    gridTemplateColumns: `repeat(${previewWidth}, minmax(0, 1fr))`,
+                    maxWidth: previewWidth <= 8 ? '160px' : '100%',
+                    width: '100%'
+                  }}
+                >
+                  {Array.from({ length: previewHeight * previewWidth }).map((_, i) => {
+                    const pixel = currentFrame?.pixels?.[i] || [0, 0, 0, 0];
+                    const isTransparent = (!pixel[3] || pixel[3] < 64);
+                    const bgStyle = isTransparent 
+                      ? '#121721' 
+                      : `rgb(${pixel[0]}, ${pixel[1]}, ${pixel[2]})`;
+
+                    return (
+                      <div
+                        key={i}
+                        style={{ 
+                          backgroundColor: bgStyle,
+                          boxShadow: (!isTransparent) ? `0 0 5px 1px ${bgStyle}60` : 'none'
+                        }}
+                        className="aspect-square rounded-[2px] transition-colors duration-75 relative"
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Meta text banner + NCI2 binary layout breakdown */}
+            <div className="text-center font-mono text-[11px] text-slate-500 dark:text-slate-400 py-1.5 px-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg space-y-1">
+              <div>{metaInfo}</div>
+              {buildMeta && buildMeta.version === 'NCI2' && (
+                <div className="text-[10px] text-emerald-600 dark:text-emerald-400 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5">
+                  <span>magic=&quot;NCI2&quot;</span>
+                  <span>flags=0x{buildMeta.flags.toString(16).padStart(2, '0')}</span>
+                  <span>frameMs={buildMeta.headerFrameMs}</span>
+                  <span>长度=12+{buildMeta.delayTableBytes}+{buildMeta.pixelBytes}={buildMeta.totalBytes}B</span>
+                </div>
+              )}
+            </div>
+
+          </div>
+
+          {/* Action Buttons Toolbar placed directly below the Preview */}
+          <div className="grid grid-cols-2 gap-2">
             
             {/* Primary Convert */}
             <button
               onClick={() => handleConvert()}
               disabled={isProcessing}
-              className="px-4 py-2 bg-gradient-to-r from-[#E60012] to-amber-600 hover:from-[#CC0010] hover:to-amber-700 active:scale-95 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md shadow-red-950/20 transition-all cursor-pointer"
+              className="w-full justify-center px-3 py-2.5 bg-gradient-to-r from-[#E60012] to-amber-600 hover:from-[#CC0010] hover:to-amber-700 active:scale-[0.98] disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md shadow-red-950/20 transition-all cursor-pointer"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isProcessing ? 'animate-spin' : ''}`} />
-              <span>{isProcessing ? '正在转换...' : '执行转换'}</span>
+              <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isProcessing ? 'animate-spin' : ''}`} />
+              <span className="truncate">{isProcessing ? '正在转换...' : '执行转换'}</span>
             </button>
 
             {/* Load directly to Simulator */}
             <button
               onClick={handleLoadToSimulator}
               disabled={frames.length === 0}
-              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
-              title="将转换得到的每一帧实时载入上方 8×32 硬件时钟仿真器进行真彩连播"
+              className="w-full justify-center px-3 py-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+              title="将转换得到的每一帧载入上方 8×32 时钟屏幕进行预览与像素微调"
             >
-              <Play className="w-3.5 h-3.5" />
-              <span>载入上方时钟</span>
+              <Edit3 className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">载入上方时钟修改</span>
             </button>
 
             {/* Download .NCI */}
             <button
               onClick={handleDownloadNci}
               disabled={!nciBlob}
-              className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+              className="w-full justify-center px-3 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
             >
-              <Download className="w-3.5 h-3.5" />
-              <span>下载 .nci 固件</span>
+              <Download className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">下载 .nci 固件</span>
             </button>
 
             {/* Copy C++ Code */}
             <button
               onClick={handleCopyCppCode}
               disabled={frames.length === 0}
-              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+              className="w-full justify-center px-3 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
             >
-              {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copiedCode ? '已复制' : '复制 C++ 数组'}</span>
+              {copiedCode ? <Check className="w-3.5 h-3.5 shrink-0 text-emerald-500" /> : <Copy className="w-3.5 h-3.5 shrink-0" />}
+              <span className="truncate">{copiedCode ? '已复制' : '复制 C++ 数组'}</span>
             </button>
 
-            {/* Push to Device */}
-            {deviceUrl.trim() && (
-              <button
-                onClick={handleUploadToDevice}
-                disabled={!nciBlob}
-                className="px-3 py-2 bg-blue-600/10 hover:bg-blue-600/20 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-blue-600 dark:text-blue-400 border border-blue-500/30 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>推送到设备</span>
-              </button>
-            )}
+            {/* Push to Device: Always shown on full row, grayed out when firmware or IP is missing */}
+            <button
+              onClick={handleUploadToDevice}
+              disabled={!nciBlob || !deviceUrl.trim()}
+              className="col-span-2 w-full justify-center px-4 py-2.5 bg-blue-600 hover:bg-blue-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-blue-600 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm shadow-blue-950/20 transition-all cursor-pointer"
+              title={!deviceUrl.trim() ? '请先在左侧填写 ESP32 局域网地址并转换固件' : '将当前 .nci 固件直接推送到局域网 ESP32 设备'}
+            >
+              <Send className="w-3.5 h-3.5 shrink-0" />
+              <span>推送到设备{deviceUrl.trim() ? ` (${deviceUrl.trim()})` : ''}</span>
+            </button>
 
           </div>
 
-        </div>
-
-        {/* Right Column: Hardware Pixel Simulation Preview (5 cols) */}
-        <div className="lg:col-span-5 bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 flex flex-col justify-between space-y-4">
-          
-          <div className="flex items-center justify-between text-xs">
-            <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-              <Eye className="w-3.5 h-3.5 text-[#E60012]" />
-              <span>点阵屏仿真预览 ({targetWidth}×{targetHeight})</span>
-            </span>
-
-            {frames.length > 1 && (
-              <div className="flex items-center gap-2 font-mono text-[11px] text-slate-500">
-                <button
-                  onClick={() => setIsPlaying(!isPlaying)}
-                  className="px-2 py-0.5 rounded bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:text-slate-900 dark:hover:text-white flex items-center gap-1"
-                >
-                  {isPlaying ? <Pause className="w-2.5 h-2.5 text-amber-500" /> : <Play className="w-2.5 h-2.5 text-emerald-500" />}
-                  <span>{isPlaying ? '暂停' : '播放'}</span>
-                </button>
-                <span>{activeFrameIndex + 1} / {frames.length} 帧</span>
-              </div>
-            )}
-          </div>
-
-          {/* Pixel LED Matrix Chassis matching top display */}
-          <div className="w-full flex items-center justify-center py-2">
-            <div className="p-3 rounded-xl bg-[#0F141E] border border-slate-800 shadow-inner w-full flex items-center justify-center">
-              <div 
-                className="grid gap-[2px] sm:gap-[3px] select-none"
-                style={{
-                  gridTemplateColumns: `repeat(${targetWidth}, minmax(0, 1fr))`,
-                  maxWidth: targetWidth === 8 ? '160px' : '100%',
-                  width: '100%'
-                }}
-              >
-                {Array.from({ length: targetHeight * targetWidth }).map((_, i) => {
-                  const pixel = currentFrame?.pixels?.[i] || [0, 0, 0, 0];
-                  const isTransparent = (!pixel[3] || pixel[3] < 64);
-                  const bgStyle = isTransparent 
-                    ? '#121721' 
-                    : `rgb(${pixel[0]}, ${pixel[1]}, ${pixel[2]})`;
-
-                  return (
-                    <div
-                      key={i}
-                      style={{ 
-                        backgroundColor: bgStyle,
-                        boxShadow: (!isTransparent) ? `0 0 5px 1px ${bgStyle}60` : 'none'
-                      }}
-                      className="aspect-square rounded-[2px] transition-colors duration-75 relative"
-                    />
-                  );
-                })}
-              </div>
+          {syncBadge && (
+            <div className="px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 text-xs font-medium flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5">
+                <Check className="w-3.5 h-3.5 text-emerald-500" />
+                <span>{syncBadge} — 现在可直接点击「下载 .nci 固件」或「推送到设备」</span>
+              </span>
             </div>
-          </div>
-
-          {/* Meta text banner */}
-          <div className="text-center font-mono text-[11px] text-slate-500 dark:text-slate-400 py-1.5 px-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg">
-            {metaInfo}
-          </div>
+          )}
 
         </div>
 

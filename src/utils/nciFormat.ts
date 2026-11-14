@@ -1,6 +1,12 @@
 // NCI RGB565 Binary Format & GIF/PNG Converter Utility
-// Faithfully matching the NeoClock / Awtrix specification from index_3f785a56.html
-// Magic Header: "NCI1" (0x4E, 0x43, 0x49, 0x31)
+// Supports both legacy "NCI1" and "NCI2" (with optional VARTIME per-frame delay table)
+// Magic Headers: "NCI1" (0x4E, 0x43, 0x49, 0x31) | "NCI2" (0x4E, 0x43, 0x49, 0x32)
+
+export type NciFormatVersion = 'NCI1' | 'NCI2';
+export type NciVarTimeMode = 'auto' | 'always' | 'off';
+
+export const NCI2_FLAG_RGB565 = 0x01;
+export const NCI2_FLAG_VARTIME = 0x02;
 
 export interface NciPixelRGBA {
   0: number; // Red (0..255)
@@ -15,11 +21,36 @@ export interface NciRawFrame {
 }
 
 export interface NciAnimationData {
+  version: NciFormatVersion;
   width: number;
   height: number;
   frameCount: number;
   frameMs: number;
+  rawFrameMs?: number;
+  flags: number;
+  hasVarTime: boolean;
+  frameDelays: number[];
   frames: NciRawFrame[];
+}
+
+export interface MakeNci2Options {
+  varTime?: NciVarTimeMode;
+  useZeroForDefault200?: boolean;
+}
+
+export interface NciBuildResult {
+  blob: Blob;
+  version: NciFormatVersion;
+  width: number;
+  height: number;
+  frameCount: number;
+  flags: number;
+  hasVarTime: boolean;
+  headerFrameMs: number;
+  delayTableBytes: number;
+  pixelBytes: number;
+  totalBytes: number;
+  frameDelays: number[];
 }
 
 /** Convert R, G, B (0..255) to 16-bit RGB565 integer */
@@ -67,8 +98,14 @@ export function hexToRgb565(hex: string): number {
   return rgb565(r, g, b);
 }
 
+/** Normalize a single frame delay in ms according to NCI2 constraints (>= 30ms, max 65535ms) */
+export function normalizeNci2FrameDelay(ms: number | undefined, fallback: number = 200): number {
+  if (!ms || ms <= 0) return Math.max(30, Math.min(65535, Math.round(fallback)));
+  return Math.max(30, Math.min(65535, Math.round(ms)));
+}
+
 /**
- * Create NCI binary Blob from NciRawFrame array
+ * Create legacy NCI1 binary Blob from NciRawFrame array
  * Header layout (12 bytes):
  * - Byte 0..3: 'N', 'C', 'I', '1' (78, 67, 73, 49)
  * - Byte 4: width (uint8)
@@ -111,10 +148,177 @@ export function makeNci(frames: NciRawFrame[], w: number, h: number, frameMs: nu
 }
 
 /**
- * Convert 8x32 / custom hex color grids into NCI Raw Frames, then make NCI binary Blob
+ * Create NCI2 binary firmware + detailed layout metadata from NciRawFrame array.
+ *
+ * NCI2 Specification:
+ * - 12-byte Header:
+ *   0..3: "NCI2"
+ *   4: width (u8, 1..32)
+ *   5: height (u8, 1..8)
+ *   6: frameCount (u8, 1..60)
+ *   7: flags (u8): bit0 0x01 RGB565 (must be set), bit1 0x02 VARTIME per-frame delay table
+ *   8..9: frameMs (u16 LE): when NOT VARTIME, 0 = default 200ms, otherwise MUST be >= 30
+ *   10..11: reserved (u16 LE): 0
+ * - Optional Delay Table (only when flags & 0x02): frameCount * u16 LE ms per frame
+ * - Pixel Data: frameCount * width * height * u16 LE RGB565 (row-major, RRRRRGGGGGGBBBBB, 0x0000 = transparent)
+ * - Exact Total Byte Length: 12 + delayTableBytes + pixelBytes
  */
-export function makeNciFromHexGrids(hexGrids: string[][][], w: number, h: number, frameMs: number): Blob {
-  const frames: NciRawFrame[] = hexGrids.map(grid => {
+export function buildNci2(
+  frames: NciRawFrame[],
+  w: number,
+  h: number,
+  frameMs: number = 0,
+  options: MakeNci2Options = {}
+): NciBuildResult {
+  if (!Number.isInteger(w) || w < 1 || w > 32) {
+    throw new Error(`NCI2 宽度超出范围 (1..32): ${w}`);
+  }
+  if (!Number.isInteger(h) || h < 1 || h > 8) {
+    throw new Error(`NCI2 高度超出范围 (1..8): ${h}`);
+  }
+  const fc = frames.length;
+  if (fc < 1 || fc > 60) {
+    throw new Error(`NCI2 帧数超出范围 (1..60): ${fc}`);
+  }
+
+  const varTimeMode: NciVarTimeMode = options.varTime ?? 'auto';
+  const normalizedDelays = frames.map(fr =>
+    normalizeNci2FrameDelay(fr.delay, frameMs > 0 ? frameMs : 200)
+  );
+  const hasDistinctDelays = fc > 1 && new Set(normalizedDelays).size > 1;
+
+  const useVarTime =
+    varTimeMode === 'always'
+      ? true
+      : varTimeMode === 'off'
+        ? false
+        : hasDistinctDelays;
+
+  const flags = NCI2_FLAG_RGB565 | (useVarTime ? NCI2_FLAG_VARTIME : 0);
+
+  // Header frameMs rule:
+  // When NOT VARTIME: 0 = default 200ms; otherwise must be >= 30
+  let headerFrameMs: number;
+  if (!useVarTime) {
+    if (frameMs === 0 || (options.useZeroForDefault200 && frameMs === 200)) {
+      headerFrameMs = 0;
+    } else {
+      headerFrameMs = Math.max(30, Math.min(65535, Math.round(frameMs)));
+    }
+  } else {
+    headerFrameMs = frameMs === 0 ? 0 : Math.max(30, Math.min(65535, Math.round(frameMs)));
+  }
+
+  const headerBytes = 12;
+  const delayTableBytes = useVarTime ? fc * 2 : 0;
+  const pixelBytes = fc * w * h * 2;
+  const totalBytes = headerBytes + delayTableBytes + pixelBytes;
+
+  const buf = new ArrayBuffer(totalBytes);
+  const v = new DataView(buf);
+
+  v.setUint8(0, 78); // 'N'
+  v.setUint8(1, 67); // 'C'
+  v.setUint8(2, 73); // 'I'
+  v.setUint8(3, 50); // '2'
+  v.setUint8(4, w);
+  v.setUint8(5, h);
+  v.setUint8(6, fc);
+  v.setUint8(7, flags);
+  v.setUint16(8, headerFrameMs, true);
+  v.setUint16(10, 0, true); // reserved = 0
+
+  let o = headerBytes;
+  if (useVarTime) {
+    for (let i = 0; i < fc; i++) {
+      v.setUint16(o, normalizedDelays[i], true);
+      o += 2;
+    }
+  }
+
+  for (const fr of frames) {
+    for (let i = 0; i < w * h; i++) {
+      const p = fr.pixels[i] || [0, 0, 0, 0];
+      const val = (!p[3] || p[3] < 64) ? 0 : rgb565(p[0], p[1], p[2]);
+      v.setUint16(o, val, true);
+      o += 2;
+    }
+  }
+
+  const effectiveFixedMs = headerFrameMs === 0 ? 200 : headerFrameMs;
+  return {
+    blob: new Blob([buf], { type: 'application/octet-stream' }),
+    version: 'NCI2',
+    width: w,
+    height: h,
+    frameCount: fc,
+    flags,
+    hasVarTime: useVarTime,
+    headerFrameMs,
+    delayTableBytes,
+    pixelBytes,
+    totalBytes,
+    frameDelays: useVarTime ? normalizedDelays : Array(fc).fill(effectiveFixedMs),
+  };
+}
+
+/** Create NCI2 binary Blob directly */
+export function makeNci2(
+  frames: NciRawFrame[],
+  w: number,
+  h: number,
+  frameMs: number = 0,
+  options: MakeNci2Options = {}
+): Blob {
+  return buildNci2(frames, w, h, frameMs, options).blob;
+}
+
+/**
+ * Unified NCI builder returning Blob and byte layout details for NCI1 or NCI2
+ */
+export function buildNciByVersion(
+  version: NciFormatVersion,
+  frames: NciRawFrame[],
+  w: number,
+  h: number,
+  frameMs: number = 0,
+  options: MakeNci2Options = {}
+): NciBuildResult {
+  if (version === 'NCI2') {
+    return buildNci2(frames, w, h, frameMs, options);
+  }
+  const safeFixedMs = frameMs > 0 ? Math.max(30, Math.min(65535, Math.round(frameMs))) : (frames[0]?.delay || 200);
+  const blob = makeNci(frames, w, h, safeFixedMs);
+  const pixelBytes = frames.length * w * h * 2;
+  return {
+    blob,
+    version: 'NCI1',
+    width: w,
+    height: h,
+    frameCount: frames.length,
+    flags: 0x01,
+    hasVarTime: false,
+    headerFrameMs: safeFixedMs,
+    delayTableBytes: 0,
+    pixelBytes,
+    totalBytes: 12 + pixelBytes,
+    frameDelays: Array(frames.length).fill(safeFixedMs),
+  };
+}
+
+/**
+ * Convert 8x32 / custom hex color grids into NCI Raw Frames, then make NCI1 or NCI2 binary Blob
+ */
+export function makeNciFromHexGrids(
+  hexGrids: string[][][],
+  w: number,
+  h: number,
+  frameMs: number,
+  version: NciFormatVersion = 'NCI1',
+  frameDelays?: number[],
+  options: MakeNci2Options = {}
+): Blob {
+  const frames: NciRawFrame[] = hexGrids.map((grid, idx) => {
     const pixels: [number, number, number, number][] = [];
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
@@ -122,14 +326,14 @@ export function makeNciFromHexGrids(hexGrids: string[][][], w: number, h: number
         pixels.push(hexToRgba(hex));
       }
     }
-    return { pixels, delay: frameMs };
+    return { pixels, delay: frameDelays?.[idx] ?? frameMs };
   });
 
-  return makeNci(frames, w, h, frameMs);
+  return buildNciByVersion(version, frames, w, h, frameMs, options).blob;
 }
 
 /**
- * Parse an NCI binary file from ArrayBuffer
+ * Parse an NCI1 or NCI2 binary file from ArrayBuffer
  */
 export function parseNci(buffer: ArrayBuffer): NciAnimationData {
   if (buffer.byteLength < 12) {
@@ -137,34 +341,119 @@ export function parseNci(buffer: ArrayBuffer): NciAnimationData {
   }
   const view = new DataView(buffer);
   const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-  if (magic !== 'NCI1') {
-    throw new Error(`未知的文件头标识: ${magic}，应为 NCI1`);
+
+  if (magic !== 'NCI1' && magic !== 'NCI2') {
+    throw new Error(`未知的文件头标识: ${magic}，应为 NCI1 或 NCI2`);
   }
 
   const width = view.getUint8(4);
   const height = view.getUint8(5);
   const frameCount = view.getUint8(6);
-  const frameMs = view.getUint16(8, true);
+  const flagsOrVer = view.getUint8(7);
+  const rawFrameMs = view.getUint16(8, true);
+
+  if (magic === 'NCI1') {
+    const effectiveMs = rawFrameMs || 200;
+    const frames: NciRawFrame[] = [];
+    let offset = 12;
+    const pixelsPerFrame = width * height;
+
+    for (let f = 0; f < frameCount; f++) {
+      const pixels: [number, number, number, number][] = [];
+      for (let p = 0; p < pixelsPerFrame; p++) {
+        if (offset + 1 < buffer.byteLength) {
+          const val = view.getUint16(offset, true);
+          offset += 2;
+          pixels.push(rgb565ToRgba(val));
+        } else {
+          pixels.push([0, 0, 0, 0]);
+        }
+      }
+      frames.push({ pixels, delay: effectiveMs });
+    }
+
+    return {
+      version: 'NCI1',
+      width,
+      height,
+      frameCount,
+      frameMs: effectiveMs,
+      rawFrameMs,
+      flags: NCI2_FLAG_RGB565,
+      hasVarTime: false,
+      frameDelays: Array(frameCount).fill(effectiveMs),
+      frames,
+    };
+  }
+
+  // NCI2 validation
+  if (width < 1 || width > 32) {
+    throw new Error(`NCI2 width 无效: ${width} (应为 1..32)`);
+  }
+  if (height < 1 || height > 8) {
+    throw new Error(`NCI2 height 无效: ${height} (应为 1..8)`);
+  }
+  if (frameCount < 1 || frameCount > 60) {
+    throw new Error(`NCI2 frameCount 无效: ${frameCount} (应为 1..60)`);
+  }
+  if ((flagsOrVer & NCI2_FLAG_RGB565) === 0) {
+    throw new Error(`NCI2 flags 无效 (0x${flagsOrVer.toString(16).padStart(2, '0')})：必须置位 bit0 RGB565 (0x01)`);
+  }
+
+  const hasVarTime = (flagsOrVer & NCI2_FLAG_VARTIME) !== 0;
+  if (!hasVarTime && rawFrameMs !== 0 && rawFrameMs < 30) {
+    throw new Error(`NCI2 非 VARTIME 模式下 frameMs 无效 (${rawFrameMs}ms)：必须为 0 或 >= 30`);
+  }
+
+  const delayTableBytes = hasVarTime ? frameCount * 2 : 0;
+  const pixelBytes = frameCount * width * height * 2;
+  const expectedLength = 12 + delayTableBytes + pixelBytes;
+  if (buffer.byteLength !== expectedLength) {
+    throw new Error(
+      `NCI2 文件长度不匹配：实际 ${buffer.byteLength} 字节，期望精确等于 ${expectedLength} 字节 (12 + ${delayTableBytes} + ${pixelBytes})`
+    );
+  }
+
+  const defaultFrameMs = rawFrameMs === 0 ? 200 : rawFrameMs;
+  let offset = 12;
+  const frameDelays: number[] = [];
+
+  if (hasVarTime) {
+    for (let f = 0; f < frameCount; f++) {
+      const d = view.getUint16(offset, true);
+      offset += 2;
+      frameDelays.push(d === 0 ? 200 : d);
+    }
+  } else {
+    for (let f = 0; f < frameCount; f++) {
+      frameDelays.push(defaultFrameMs);
+    }
+  }
 
   const frames: NciRawFrame[] = [];
-  let offset = 12;
   const pixelsPerFrame = width * height;
-
   for (let f = 0; f < frameCount; f++) {
     const pixels: [number, number, number, number][] = [];
     for (let p = 0; p < pixelsPerFrame; p++) {
-      if (offset + 1 < buffer.byteLength) {
-        const val = view.getUint16(offset, true);
-        offset += 2;
-        pixels.push(rgb565ToRgba(val));
-      } else {
-        pixels.push([0, 0, 0, 0]);
-      }
+      const val = view.getUint16(offset, true);
+      offset += 2;
+      pixels.push(rgb565ToRgba(val));
     }
-    frames.push({ pixels, delay: frameMs });
+    frames.push({ pixels, delay: frameDelays[f] });
   }
 
-  return { width, height, frameCount, frameMs, frames };
+  return {
+    version: 'NCI2',
+    width,
+    height,
+    frameCount,
+    frameMs: defaultFrameMs,
+    rawFrameMs,
+    flags: flagsOrVer,
+    hasVarTime,
+    frameDelays,
+    frames,
+  };
 }
 
 /**
@@ -531,10 +820,13 @@ export function generateCppRgb565Code(
   animName: string,
   width: number = 32,
   height: number = 8,
-  frameMs: number = 120
+  frameMs: number = 120,
+  version: NciFormatVersion = 'NCI2'
 ): string {
   const frameCount = frames.length;
   const pixelsPerFrame = width * height;
+  const delays = frames.map(f => normalizeNci2FrameDelay(f.delay, frameMs || 200));
+  const isVarTime = frameCount > 1 && new Set(delays).size > 1;
 
   const frameBlocks = frames.map((frame, fIdx) => {
     const hexLines: string[] = [];
@@ -549,17 +841,21 @@ export function generateCppRgb565Code(
       }
       hexLines.push(`    ${chunk.join(', ')}`);
     }
-    return `  // Frame ${fIdx} (${width}x${height})\n  {\n${hexLines.join(',\n')}\n  }`;
+    return `  // Frame ${fIdx} (${width}x${height}, ${delays[fIdx]}ms)\n  {\n${hexLines.join(',\n')}\n  }`;
   });
 
-  return `// ESP32-S3 ${width}x${height} NCI RGB565 Animation
-// Name: ${animName} | Frames: ${frameCount} | Interval: ${frameMs}ms
+  const varTimeSection = isVarTime
+    ? `\n// NCI2 VARTIME per-frame durations (ms)\nconst uint16_t PROGMEM anim_frame_delays_ms[ANIM_FRAME_COUNT] = { ${delays.join(', ')} };\n`
+    : '';
+
+  return `// ESP32-S3 ${width}x${height} ${version} RGB565 Animation${isVarTime ? ' (VARTIME)' : ''}
+// Name: ${animName} | Frames: ${frameCount} | Default Interval: ${frameMs || 200}ms
 #define ANIM_WIDTH       ${width}
 #define ANIM_HEIGHT      ${height}
 #define ANIM_FRAME_COUNT ${frameCount}
-#define ANIM_FRAME_MS    ${frameMs}
-
-// 16-bit RGB565 Framebuffer (PROGMEM flash storage)
+#define ANIM_FRAME_MS    ${frameMs || 200}
+${varTimeSection}
+// 16-bit RGB565 Framebuffer (PROGMEM flash storage, 0x0000 = transparent)
 const uint16_t PROGMEM anim_rgb565[ANIM_FRAME_COUNT][${pixelsPerFrame}] = {
 ${frameBlocks.join(',\n')}
 };
@@ -568,6 +864,7 @@ ${frameBlocks.join(',\n')}
 // void drawNciFrame(uint8_t frameIdx) {
 //   for (int i = 0; i < ${pixelsPerFrame}; i++) {
 //     uint16_t color565 = pgm_read_word(&(anim_rgb565[frameIdx][i]));
+//     if (color565 == 0x0000) continue; // transparent pixel
 //     matrix.drawPixel(i % ${width}, i / ${width}, color565);
 //   }
 // }`;

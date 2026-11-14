@@ -126,6 +126,53 @@ app.get('/api/ping-device', async (req, res) => {
   }
 });
 
+// Fetch LaMetric icon by numeric ID (https://developer.lametric.com/content/apps/icon_thumbs/:id)
+app.get('/api/lametric-icon/:id', async (req, res) => {
+  const rawId = (req.params.id || '').trim();
+  const match = rawId.match(/(\d{1,10})/);
+  if (!match) {
+    return res.status(400).json({ error: '无效的 LaMetric 图标 ID，应为纯数字（如 230）' });
+  }
+  const cleanId = match[1];
+  const remoteUrl = `https://developer.lametric.com/content/apps/icon_thumbs/${cleanId}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const upstream = await fetch(remoteUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'image/gif,image/png,image/webp,image/*,*/*',
+        'User-Agent': 'NeoClock-Studio/1.0',
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        error: upstream.status === 404
+          ? `未找到 ID 为 ${cleanId} 的 LaMetric 图标`
+          : `LaMetric 服务器返回 HTTP ${upstream.status}`,
+      });
+    }
+
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    const arrBuf = await upstream.arrayBuffer();
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.send(Buffer.from(arrBuf));
+  } catch (err: any) {
+    const isTimeout = err.name === 'AbortError' || err.message?.includes('aborted');
+    return res.status(502).json({
+      error: isTimeout
+        ? `拉取 LaMetric 图标 #${cleanId} 超时`
+        : `拉取 LaMetric 图标失败: ${err.message}`,
+    });
+  }
+});
+
 // Initialize GoogleGenAI client with telemetry header
 const getGenAIClient = () => {
   const apiKey = process.env.GEMINI_API_KEY;

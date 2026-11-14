@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for integrating an AI-powered 8x32 pixel frame animation generator into the ESP-PixelMatrix Studio workbench with a multi-frame timeline player, real-time browser preview, and C++ code export for Arduino/ESP-IDF.",
-  "updatedAt":  "2026-10-26T05:25:06.643510699Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}
