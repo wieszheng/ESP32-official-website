@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   FileCode, Upload, Download, Copy, Check, Play, Pause,
-  Layers, Eye, Send, Terminal, Sparkles, RefreshCw, X, ArrowUpRight, Wifi, Edit3, Hash
+  Layers, Eye, Send, Terminal, Sparkles, RefreshCw, X, ArrowUpRight, Wifi, Edit3, Hash,
+  Search, Grid, ChevronLeft, ChevronRight, Database
 } from 'lucide-react';
 import { 
   buildNciByVersion, parseNci, fileToNciFrames, downloadNciBlob, generateCppRgb565Code,
@@ -71,9 +72,23 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
   const [deviceTestResult, setDeviceTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [lametricInput, setLametricInput] = useState<string>('230');
   const [isFetchingLametric, setIsFetchingLametric] = useState<boolean>(false);
+  const [showLibraryBrowser, setShowLibraryBrowser] = useState<boolean>(false);
+  const [libraryStats, setLibraryStats] = useState<{
+    ready: boolean;
+    totalIcons: number;
+    pngCount: number;
+    gifCount: number;
+  } | null>(null);
+  const [libQuery, setLibQuery] = useState<string>('');
+  const [libType, setLibType] = useState<'all' | 'gif' | 'png'>('all');
+  const [libPage, setLibPage] = useState<number>(1);
+  const [libTotal, setLibTotal] = useState<number>(0);
+  const [libTotalPages, setLibTotalPages] = useState<number>(1);
+  const [libItems, setLibItems] = useState<{ id: number; title: string; type: 'gif' | 'png' }[]>([]);
+  const [isLoadingLib, setIsLoadingLib] = useState<boolean>(false);
   const [syncBadge, setSyncBadge] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([
-    { text: '转换引擎已就绪：支持 PNG / GIF / .NCI (NCI1/NCI2) 与 LaMetric 图标 ID（如 230）在线拉取，默认输出 NCI2 格式', type: 'info', time: 'SYS' }
+    { text: '转换引擎已就绪：支持 PNG / GIF / .NCI (NCI1/NCI2) 与 LaMetric 本地全库图标加载，默认输出 NCI2 格式', type: 'info', time: 'SYS' }
   ]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -96,6 +111,52 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
   function validName(s: string): boolean {
     return /^[A-Za-z0-9_-]{1,31}$/.test(s);
   }
+
+  // Check local LaMetric library availability on mount
+  useEffect(() => {
+    fetch('/api/lametric-icons?page=1&pageSize=1')
+      .then(r => r.json())
+      .then(data => {
+        if (data?.stats) {
+          setLibraryStats(data.stats);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Search/paginate local LaMetric icon library when browser is open
+  useEffect(() => {
+    if (!showLibraryBrowser) return;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setIsLoadingLib(true);
+      try {
+        const params = new URLSearchParams({
+          q: libQuery,
+          type: libType,
+          page: String(libPage),
+          pageSize: '36',
+        });
+        const res = await fetch(`/api/lametric-icons?${params.toString()}`);
+        const data = await res.json();
+        if (!cancelled && data) {
+          if (data.stats) setLibraryStats(data.stats);
+          setLibItems(Array.isArray(data.items) ? data.items : []);
+          setLibTotal(data.total || 0);
+          setLibTotalPages(data.totalPages || 1);
+        }
+      } catch {
+        // ignore transient errors
+      } finally {
+        if (!cancelled) setIsLoadingLib(false);
+      }
+    }, libQuery ? 160 : 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [showLibraryBrowser, libQuery, libType, libPage]);
 
   // Animation player timer matching exact GIF delays
   useEffect(() => {
@@ -357,12 +418,14 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
     try {
       let blob: Blob | null = null;
       let contentType = '';
+      let fromLocal = false;
 
-      // 1. Try local backend proxy (/api/lametric-icon/:id)
+      // 1. Try local repository library / backend proxy (/api/lametric-icon/:id)
       try {
         const proxyRes = await fetch(`/api/lametric-icon/${cleanId}`);
         if (proxyRes.ok) {
           contentType = proxyRes.headers.get('content-type') || '';
+          fromLocal = proxyRes.headers.get('x-lametric-source') === 'local-library';
           blob = await proxyRes.blob();
         } else if (proxyRes.status === 404) {
           throw new Error(`LaMetric 官方库中不存在 ID 为 #${cleanId} 的图标`);
@@ -400,7 +463,10 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
       setFile(fetchedFile);
       setIconName(newIconName);
 
-      addLog(`✅ 成功获取 LaMetric 图标 #${cleanId} (${isGif ? 'GIF 动图' : 'PNG 静态图'}, ${blob.size} 字节)，正在转换为 8×8 RGB565...`, 'ok');
+      addLog(
+        `✅ 已从${fromLocal ? '本地离线库' : 'LaMetric 在线源'}加载图标 #${cleanId} (${isGif ? 'GIF 动图' : 'PNG 静态图'}, ${blob.size} 字节)，正在转换为 8×8 RGB565...`,
+        'ok'
+      );
 
       await handleConvert(fetchedFile, 8, 8, newIconName);
     } catch (err: any) {
@@ -763,22 +829,45 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
             </button>
           </div>
 
-          {/* LaMetric Icon ID Online Loader */}
+          {/* LaMetric Icon ID & Local Full Library Loader */}
           <div className="p-3.5 rounded-xl bg-slate-50/80 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700/80 space-y-2.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <label className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-                <Hash className="w-3.5 h-3.5 text-[#E60012]" />
-                <span>从 LaMetric 图标库通过 ID 加载 (8×8 原生图标)</span>
-              </label>
-              <a
-                href="https://developer.lametric.com/icons"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-0.5 font-mono"
-              >
-                <span>浏览 LaMetric 图标库</span>
-                <ArrowUpRight className="w-3 h-3" />
-              </a>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                  <Hash className="w-3.5 h-3.5 text-[#E60012]" />
+                  <span>LaMetric 8×8 图标库</span>
+                </label>
+                {libraryStats?.ready && (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+                    <Database className="w-2.5 h-2.5" />
+                    <span>已入库 {libraryStats.totalIcons.toLocaleString()} 枚</span>
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowLibraryBrowser(prev => !prev)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 border transition-colors cursor-pointer ${
+                    showLibraryBrowser
+                      ? 'bg-[#E60012] text-white border-[#E60012]'
+                      : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:border-[#E60012]/50 hover:text-[#E60012]'
+                  }`}
+                >
+                  <Grid className="w-3 h-3" />
+                  <span>{showLibraryBrowser ? '收起全库浏览' : '浏览本地全库'}</span>
+                </button>
+                <a
+                  href="https://developer.lametric.com/icons"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-0.5 font-mono"
+                >
+                  <span>官网库</span>
+                  <ArrowUpRight className="w-3 h-3" />
+                </a>
+              </div>
             </div>
 
             <div className="flex items-center gap-2">
@@ -802,7 +891,7 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
                 className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 dark:bg-[#E60012] dark:hover:bg-[#CC0010] active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition-all whitespace-nowrap cursor-pointer"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isFetchingLametric ? 'animate-spin' : ''}`} />
-                <span>{isFetchingLametric ? '拉取中...' : '加载图标 ID'}</span>
+                <span>{isFetchingLametric ? '加载中...' : '加载图标 ID'}</span>
               </button>
             </div>
 
@@ -833,6 +922,146 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
                 </button>
               ))}
             </div>
+
+            {/* Expandable Local LaMetric Full Icon Library Browser */}
+            {showLibraryBrowser && (
+              <div className="mt-2 pt-3 border-t border-slate-200 dark:border-slate-700/80 space-y-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative flex-1 min-w-[160px]">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={libQuery}
+                      onChange={e => {
+                        setLibQuery(e.target.value);
+                        setLibPage(1);
+                      }}
+                      placeholder="按关键词 (clock, cat, fire, btc) 或 ID 搜索..."
+                      className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg pl-8 pr-7 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-[#E60012]/30"
+                    />
+                    {libQuery && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setLibQuery('');
+                          setLibPage(1);
+                        }}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center bg-slate-200/70 dark:bg-slate-900 rounded-lg p-0.5 text-[10px] font-mono">
+                    {[
+                      { key: 'all' as const, label: '全部' },
+                      { key: 'gif' as const, label: 'GIF 动图' },
+                      { key: 'png' as const, label: 'PNG 静态' },
+                    ].map(opt => (
+                      <button
+                        key={opt.key}
+                        type="button"
+                        onClick={() => {
+                          setLibType(opt.key);
+                          setLibPage(1);
+                        }}
+                        className={`px-2 py-1 rounded-md transition-all cursor-pointer ${
+                          libType === opt.key
+                            ? 'bg-white dark:bg-slate-800 text-[#E60012] font-bold shadow-2xs'
+                            : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {!libraryStats?.ready ? (
+                  <div className="py-6 text-center text-xs text-slate-500 dark:text-slate-400 font-mono">
+                    本地图标包加载中或尚未同步完成，请稍后刷新查看...
+                  </div>
+                ) : isLoadingLib && libItems.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-slate-500 dark:text-slate-400 font-mono">
+                    正在检索本地图标库...
+                  </div>
+                ) : libItems.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-slate-500 dark:text-slate-400 font-mono">
+                    未找到匹配的图标，请更换关键词或数字 ID
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-4 sm:grid-cols-6 gap-1.5 max-h-60 overflow-y-auto pr-1 scrollbar-thin">
+                      {libItems.map(item => {
+                        const isSelected = extractLametricId(lametricInput) === String(item.id) && iconName === `lm_${item.id}`;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => handleLoadLametricIcon(String(item.id))}
+                            title={`#${item.id} · ${item.title} (${item.type.toUpperCase()})`}
+                            className={`group p-1.5 rounded-lg border text-center transition-all flex flex-col items-center gap-1 cursor-pointer ${
+                              isSelected
+                                ? 'bg-[#E60012]/10 border-[#E60012] ring-1 ring-[#E60012]/30'
+                                : 'bg-white dark:bg-slate-900/90 border-slate-200 dark:border-slate-800 hover:border-[#E60012]/50'
+                            }`}
+                          >
+                            <div className="w-8 h-8 rounded bg-[#0F141E] border border-slate-800 flex items-center justify-center overflow-hidden">
+                              <img
+                                src={`/api/lametric-icon/${item.id}`}
+                                alt={item.title}
+                                loading="lazy"
+                                className="w-6 h-6 object-contain [image-rendering:pixelated]"
+                              />
+                            </div>
+                            <div className="w-full flex items-center justify-center gap-1 text-[9px] font-mono leading-none">
+                              <span className="text-slate-700 dark:text-slate-300 font-semibold truncate">
+                                #{item.id}
+                              </span>
+                              {item.type === 'gif' && (
+                                <span className="text-[8px] px-1 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 font-bold">
+                                  GIF
+                                </span>
+                              )}
+                            </div>
+                            <span className="w-full text-[9px] text-slate-400 truncate leading-tight">
+                              {item.title}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400 pt-1">
+                      <span>
+                        共 {libTotal.toLocaleString()} 枚 · 第 {libPage} / {libTotalPages} 页
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => setLibPage(p => Math.max(1, p - 1))}
+                          disabled={libPage <= 1 || isLoadingLib}
+                          className="px-2 py-1 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:text-slate-900 dark:hover:text-white flex items-center gap-0.5 cursor-pointer"
+                        >
+                          <ChevronLeft className="w-3 h-3" />
+                          <span>上一页</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLibPage(p => Math.min(libTotalPages, p + 1))}
+                          disabled={libPage >= libTotalPages || isLoadingLib}
+                          className="px-2 py-1 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:text-slate-900 dark:hover:text-white flex items-center gap-0.5 cursor-pointer"
+                        >
+                          <span>下一页</span>
+                          <ChevronRight className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Form Settings Controls */}

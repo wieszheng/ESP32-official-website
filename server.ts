@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
+import { lametricStore } from './lib/lametricStore';
 
 dotenv.config();
 
@@ -126,7 +127,17 @@ app.get('/api/ping-device', async (req, res) => {
   }
 });
 
-// Fetch LaMetric icon by numeric ID (https://developer.lametric.com/content/apps/icon_thumbs/:id)
+// Browse & search local downloaded LaMetric icon library
+app.get('/api/lametric-icons', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : '';
+  const typeParam = req.query.type === 'gif' || req.query.type === 'png' ? req.query.type : 'all';
+  const page = Number(req.query.page) || 1;
+  const pageSize = Number(req.query.pageSize) || 48;
+  const result = lametricStore.searchCatalog({ q, type: typeParam, page, pageSize });
+  res.json(result);
+});
+
+// Fetch LaMetric icon by numeric ID (serves from local repository library first, falls back to upstream)
 app.get('/api/lametric-icon/:id', async (req, res) => {
   const rawId = (req.params.id || '').trim();
   const match = rawId.match(/(\d{1,10})/);
@@ -134,6 +145,18 @@ app.get('/api/lametric-icon/:id', async (req, res) => {
     return res.status(400).json({ error: '无效的 LaMetric 图标 ID，应为纯数字（如 230）' });
   }
   const cleanId = match[1];
+  const numericId = Number(cleanId);
+
+  // 1. Fast O(log N) lookup from local downloaded icon library
+  const localIcon = lametricStore.getIconById(numericId);
+  if (localIcon) {
+    res.setHeader('Content-Type', localIcon.contentType);
+    res.setHeader('X-LaMetric-Source', 'local-library');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.send(localIcon.buffer);
+  }
+
+  // 2. Fallback to upstream LaMetric CDN if not present locally
   const remoteUrl = `https://developer.lametric.com/content/apps/icon_thumbs/${cleanId}`;
 
   try {
@@ -161,6 +184,7 @@ app.get('/api/lametric-icon/:id', async (req, res) => {
     const arrBuf = await upstream.arrayBuffer();
 
     res.setHeader('Content-Type', contentType);
+    res.setHeader('X-LaMetric-Source', 'upstream');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     return res.send(Buffer.from(arrBuf));
   } catch (err: any) {

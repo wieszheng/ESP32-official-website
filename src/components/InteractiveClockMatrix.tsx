@@ -856,7 +856,7 @@ ${lines.join('\n')}
         </div>
 
         {/* 8x32 Physical Clock Simulator Frame (Panoramic Desktop Format) */}
-        <div className="w-full max-w-4xl mx-auto mb-8">
+        <div className="w-full max-w-6xl mx-auto mb-8">
           <div className="bg-[#0F141E] p-5 sm:p-7 rounded-2xl border border-slate-800 shadow-2xl relative">
             
             {/* Device top strip: Light sensor & status */}
@@ -1044,7 +1044,7 @@ ${lines.join('\n')}
 
           {/* NCI Active Session & Quick Palette Bar on Simulator Chassis (Active in Draw or Anim mode) */}
           {(mode === 'draw' || mode === 'anim') && (
-            <div className="mt-4 max-w-4xl mx-auto space-y-2.5">
+            <div className="mt-4 max-w-6xl mx-auto space-y-2.5">
               {/* NCI Round-Trip Edit & Writeback Strip */}
               <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-slate-900/95 border border-slate-800 text-xs shadow-sm">
                 <div className="flex flex-wrap items-center gap-2">
@@ -1202,7 +1202,7 @@ ${lines.join('\n')}
         {/* ========================================================================= */}
         {/* Pixel Studio Workbench: AI Generator + Timeline Player + Manual Canvas   */}
         {/* ========================================================================= */}
-        <div className="max-w-4xl mx-auto bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm transition-colors duration-200 space-y-6">
+        <div className="w-full max-w-7xl mx-auto bg-white dark:bg-slate-900/80 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 sm:p-7 shadow-sm transition-colors duration-200 space-y-6">
           
           {/* 1. AI Pixel Animation Generator Bar */}
           <div className="bg-gradient-to-r from-red-500/5 via-amber-500/5 to-transparent dark:from-red-950/30 dark:via-amber-950/20 dark:to-transparent border border-red-500/20 dark:border-red-500/30 rounded-xl p-4">
@@ -1243,8 +1243,8 @@ ${lines.join('\n')}
             </div>
 
             {/* Prompt input row */}
-            <div className="flex flex-col sm:flex-row items-stretch gap-2 mb-3">
-              <div className="relative flex-1">
+            <div className="flex flex-col sm:flex-row items-stretch gap-2.5 mb-3">
+              <div className="relative flex-1 min-w-0">
                 <input
                   type="text"
                   value={aiPrompt}
@@ -1253,14 +1253,14 @@ ${lines.join('\n')}
                     if (e.key === 'Enter') handleGenerateAIAnimation();
                   }}
                   placeholder="用自然语言描述点阵动画，如：跳动的像素篝火、吃豆人追逐、太空入侵者、声波节奏..."
-                  className="w-full h-10 px-3.5 text-xs text-slate-900 dark:text-white bg-white dark:bg-slate-800/90 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#E60012]/40 transition-all placeholder:text-slate-400"
+                  className="w-full h-11 px-4 text-xs sm:text-sm text-slate-900 dark:text-white bg-white dark:bg-slate-800/90 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#E60012]/40 transition-all placeholder:text-slate-400"
                 />
               </div>
 
               <button
                 onClick={() => handleGenerateAIAnimation()}
                 disabled={isGeneratingAI}
-                className="h-10 px-5 text-xs font-bold text-white bg-gradient-to-r from-[#E60012] to-amber-600 hover:from-[#CC0010] hover:to-amber-700 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed rounded-xl shadow-md shadow-red-950/20 transition-all flex items-center justify-center gap-2 whitespace-nowrap"
+                className="h-11 px-6 text-xs sm:text-sm font-bold text-white bg-gradient-to-r from-[#E60012] to-amber-600 hover:from-[#CC0010] hover:to-amber-700 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed rounded-xl shadow-md shadow-red-950/20 transition-all flex items-center justify-center gap-2 whitespace-nowrap"
               >
                 {isGeneratingAI ? (
                   <>
@@ -1652,7 +1652,7 @@ ${lines.join('\n')}
         {/* ========================================================================= */}
         {/* NCI RGB565 Converter & ESP32 Device Syncer Tool                           */}
         {/* ========================================================================= */}
-        <div className="max-w-4xl mx-auto mt-8">
+        <div className="w-full max-w-7xl mx-auto mt-8">
           <NciConverterPanel 
             onLoadToSimulator={handleLoadNciToSimulator}
             writebackPayload={nciWriteback}

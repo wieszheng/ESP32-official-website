@@ -1,0 +1,39 @@
+{
+  "source": "https://developer.lametric.com/api/v2/icons",
+  "updatedAt": "2026-11-15T09:31:09.499Z",
+  "totalCatalog": 74249,
+  "totalDownloaded": 74230,
+  "pngCount": 38676,
+  "gifCount": 35554,
+  "failedCount": 19,
+  "failedIds": [
+    45843,
+    7331,
+    44657,
+    45981,
+    45982,
+    40622,
+    64721,
+    11328,
+    72164,
+    45983,
+    40624,
+    44658,
+    45979,
+    40623,
+    45980,
+    73707,
+    73706,
+    73705,
+    73704
+  ],
+  "shardCount": 3,
+  "shardSizes": [
+    10485662,
+    10468856,
+    6442637
+  ],
+  "totalPayloadBytes": 27397155,
+  "indexBytes": 1187680,
+  "catalogGzBytes": 606048
+}
