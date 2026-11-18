@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import { Layers, Cpu, Eye, Radio, Sparkles, HardDrive, CheckCircle2 } from 'lucide-react';
+import explodedChassisImg from '../assets/images/exploded_hardware_chassis_1790659650678.jpg';
+import hardwarePcbImg from '../assets/images/hardware_pcb_esp32_1790659625320.jpg';
 
 interface ComponentDetail {
   id: string;
@@ -97,7 +99,7 @@ export const HardwareDeepDive: React.FC = () => {
           <div className="lg:col-span-7 bg-white dark:bg-[#090D14] rounded-2xl border border-slate-200 dark:border-slate-800 p-3 relative overflow-hidden shadow-xl">
             <div className="relative rounded-xl overflow-hidden aspect-[16/10]">
               <img
-                src="/src/assets/images/exploded_hardware_chassis_1790659650678.jpg"
+                src={explodedChassisImg}
                 alt="ESP32 像素时钟硬件爆炸图 CAD 渲染，展示亚克力面板、蜂窝格栅、LED 点阵板与铝合金机身"
                 className="w-full h-full object-cover"
                 referrerPolicy="no-referrer"
@@ -114,7 +116,7 @@ export const HardwareDeepDive: React.FC = () => {
           <div className="lg:col-span-5 bg-white dark:bg-[#090D14] rounded-2xl border border-slate-200 dark:border-slate-800 p-3 relative overflow-hidden shadow-xl">
             <div className="relative rounded-xl overflow-hidden aspect-[4/3]">
               <img
-                src="/src/assets/images/hardware_pcb_esp32_1790659625320.jpg"
+                src={hardwarePcbImg}
                 alt="ESP32-S3 核心控制板沉金 PCB 高清微距实拍，元器件焊点工整，工业美感"
                 className="w-full h-full object-cover"
                 referrerPolicy="no-referrer"

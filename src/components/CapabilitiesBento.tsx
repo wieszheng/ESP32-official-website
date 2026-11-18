@@ -1,5 +1,6 @@
 import React from 'react';
 import { Cpu, Wifi, Waves, Thermometer, ShieldCheck, ArrowUpRight } from 'lucide-react';
+import lifestyleClockImg from '../assets/images/pixel_clock_lifestyle_1790659640775.jpg';
 
 export const CapabilitiesBento: React.FC = () => {
   return (
@@ -147,7 +148,7 @@ export const CapabilitiesBento: React.FC = () => {
             {/* Lifestyle Image in Card */}
             <div className="sm:col-span-5 relative min-h-[220px]">
               <img
-                src="/src/assets/images/pixel_clock_lifestyle_1790659640775.jpg"
+                src={lifestyleClockImg}
                 alt="ESP32 像素时钟融入温馨现代极客书桌的实际场景"
                 className="w-full h-full object-cover"
                 referrerPolicy="no-referrer"

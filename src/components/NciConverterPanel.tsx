@@ -9,6 +9,13 @@ import {
   nciRawFrameToHexGrid, normalizeNci2FrameDelay,
   NciRawFrame, NciFormatVersion, NciVarTimeMode, NciBuildResult
 } from '../utils/nciFormat';
+import {
+  initLametricLibrary,
+  searchLametricLibrary,
+  fetchStaticLametricIconBlob,
+  getLametricThumbUrl,
+  LametricBackendMode
+} from '../utils/staticLametricLibrary';
 
 export interface NciSimulatorLoadPayload {
   framesRgb: string[][][]; // always 8 rows x 32 cols for upper simulator
@@ -73,6 +80,7 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
   const [lametricInput, setLametricInput] = useState<string>('230');
   const [isFetchingLametric, setIsFetchingLametric] = useState<boolean>(false);
   const [showLibraryBrowser, setShowLibraryBrowser] = useState<boolean>(false);
+  const [libraryMode, setLibraryMode] = useState<LametricBackendMode>('api');
   const [libraryStats, setLibraryStats] = useState<{
     ready: boolean;
     totalIcons: number;
@@ -112,16 +120,20 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
     return /^[A-Za-z0-9_-]{1,31}$/.test(s);
   }
 
-  // Check local LaMetric library availability on mount
+  // Check local LaMetric library availability on mount (supports Express API and static GitHub Pages)
   useEffect(() => {
-    fetch('/api/lametric-icons?page=1&pageSize=1')
-      .then(r => r.json())
-      .then(data => {
-        if (data?.stats) {
-          setLibraryStats(data.stats);
+    let cancelled = false;
+    initLametricLibrary()
+      .then(({ mode, stats }) => {
+        if (!cancelled) {
+          setLibraryMode(mode);
+          setLibraryStats(stats);
         }
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Search/paginate local LaMetric icon library when browser is open
@@ -131,15 +143,14 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
     const timer = setTimeout(async () => {
       setIsLoadingLib(true);
       try {
-        const params = new URLSearchParams({
+        const data = await searchLametricLibrary({
           q: libQuery,
           type: libType,
-          page: String(libPage),
-          pageSize: '36',
+          page: libPage,
+          pageSize: 36,
         });
-        const res = await fetch(`/api/lametric-icons?${params.toString()}`);
-        const data = await res.json();
         if (!cancelled && data) {
+          setLibraryMode(data.mode);
           if (data.stats) setLibraryStats(data.stats);
           setLibItems(Array.isArray(data.items) ? data.items : []);
           setLibTotal(data.total || 0);
@@ -420,18 +431,31 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
       let contentType = '';
       let fromLocal = false;
 
-      // 1. Try local repository library / backend proxy (/api/lametric-icon/:id)
-      try {
-        const proxyRes = await fetch(`/api/lametric-icon/${cleanId}`);
-        if (proxyRes.ok) {
-          contentType = proxyRes.headers.get('content-type') || '';
-          fromLocal = proxyRes.headers.get('x-lametric-source') === 'local-library';
-          blob = await proxyRes.blob();
-        } else if (proxyRes.status === 404) {
-          throw new Error(`LaMetric 官方库中不存在 ID 为 #${cleanId} 的图标`);
+      const { mode } = await initLametricLibrary();
+
+      // 1. Express backend API mode (/api/lametric-icon/:id)
+      if (mode === 'api') {
+        try {
+          const proxyRes = await fetch(`/api/lametric-icon/${cleanId}`);
+          const respCt = proxyRes.headers.get('content-type') || '';
+          if (proxyRes.ok && !respCt.includes('text/html')) {
+            contentType = respCt;
+            fromLocal = proxyRes.headers.get('x-lametric-source') === 'local-library';
+            blob = await proxyRes.blob();
+          } else if (proxyRes.status === 404 && respCt.includes('application/json')) {
+            throw new Error(`LaMetric 官方库中不存在 ID 为 #${cleanId} 的图标`);
+          }
+        } catch (proxyErr: any) {
+          if (proxyErr.message?.includes('不存在')) throw proxyErr;
         }
-      } catch (proxyErr: any) {
-        if (proxyErr.message?.includes('不存在')) throw proxyErr;
+      } else {
+        // 1b. Static GitHub Pages mode: read directly from bundled data/lametric/ pack shards via HTTP Range
+        const staticIcon = await fetchStaticLametricIconBlob(Number(cleanId));
+        if (staticIcon) {
+          blob = staticIcon.blob;
+          contentType = staticIcon.contentType;
+          fromLocal = true;
+        }
       }
 
       // 2. Direct browser fetch fallback (developer.lametric.com sets Access-Control-Allow-Origin: *)
@@ -1009,7 +1033,7 @@ export const NciConverterPanel: React.FC<NciConverterPanelProps> = ({
                           >
                             <div className="w-8 h-8 rounded bg-[#0F141E] border border-slate-800 flex items-center justify-center overflow-hidden">
                               <img
-                                src={`/api/lametric-icon/${item.id}`}
+                                src={getLametricThumbUrl(item.id, libraryMode)}
                                 alt={item.title}
                                 loading="lazy"
                                 className="w-6 h-6 object-contain [image-rendering:pixelated]"

@@ -1,6 +1,7 @@
 import React from 'react';
 import { Terminal, Cpu, Sparkles, ArrowRight, ShieldCheck, Flame, Radio, Github, Star, ExternalLink } from 'lucide-react';
 import { useGitHubStar } from '../context/GitHubStarContext';
+import heroClockImg from '../assets/images/hero_esp32_pixel_clock_1790659606194.jpg';
 
 interface HeroProps {
   onOpenFlasher: () => void;
@@ -131,7 +132,7 @@ export const Hero: React.FC<HeroProps> = ({ onOpenFlasher, onExploreSimulator })
               
               {/* Product Photo Generated via generate_image */}
               <img
-                src="/src/assets/images/hero_esp32_pixel_clock_1790659606194.jpg"
+                src={heroClockImg}
                 alt="ESP32 智能像素时钟在桌面环境的实物展示，64x64彩色像素矩阵透射出温润柔和的光泽"
                 className="w-full h-auto object-cover aspect-[16/10] transition-transform duration-700 group-hover:scale-[1.02]"
                 referrerPolicy="no-referrer"
